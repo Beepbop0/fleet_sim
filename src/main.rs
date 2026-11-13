@@ -17,6 +17,9 @@ enum VesselState {
         to: usize,
         arrives_at_tick: usize,
     },
+    Docked {
+        location: usize,
+    },
 }
 
 struct Fleet {
@@ -96,12 +99,12 @@ fn apply(sim: &mut Sim, command: Command) -> Result<(), Cow<'static, str>> {
             if dest >= fleet.n {
                 Err(format!("destination can only be set to 0..{}", fleet.n))?;
             }
+            let tick = fleet.tick;
             let (Some(existing), Some(pending)) =
                 (fleet.vessels.get(&vessel), fleet.staged.get_mut(&vessel))
             else {
                 return Err(format!("unknown vessel {vessel}"))?;
             };
-
             *pending = match *existing {
                 VesselState::Idle { location: from } => {
                     if from == dest {
@@ -111,22 +114,48 @@ fn apply(sim: &mut Sim, command: Command) -> Result<(), Cow<'static, str>> {
                     VesselState::Transit {
                         from,
                         to: dest,
-                        arrives_at_tick: fleet.tick + distance,
+                        arrives_at_tick: tick + distance,
                     }
                 }
                 VesselState::Transit {
                     arrives_at_tick,
                     to,
                     ..
-                } if arrives_at_tick == fleet.tick + 1 => {
+                } if arrives_at_tick == tick + 1 => {
                     let distance = fleet.travel_times[to][dest];
                     VesselState::Transit {
                         from: to,
                         to: dest,
-                        arrives_at_tick: fleet.tick + 1 + distance,
+                        arrives_at_tick: tick + 1 + distance,
                     }
                 }
                 _ => return Err(format!("vessel {vessel} is not idle"))?,
+            };
+            Ok(())
+        }
+        Dock { vessel_id: vessel } => {
+            let (Some(existing), Some(pending)) =
+                (fleet.vessels.get(&vessel), fleet.staged.get_mut(&vessel))
+            else {
+                return Err(format!("unknown vessel {vessel}"))?;
+            };
+            *pending = match *existing {
+                VesselState::Idle { location } | VesselState::Docked { location } => {
+                    VesselState::Docked { location }
+                }
+                _ => return Err(format!("vessel {vessel} is not idle"))?,
+            };
+            Ok(())
+        }
+        Undock { vessel_id: vessel } => {
+            let (Some(existing), Some(pending)) =
+                (fleet.vessels.get(&vessel), fleet.staged.get_mut(&vessel))
+            else {
+                return Err(format!("unknown vessel {vessel}"))?;
+            };
+            *pending = match *existing {
+                VesselState::Docked { location } => VesselState::Idle { location },
+                _ => return Err(format!("vessel {vessel} is not docked"))?,
             };
             Ok(())
         }
@@ -261,6 +290,40 @@ mod tests {
                 arrives_at_tick: 4 + 3,
             },
             sim.0.as_ref().unwrap().vessels["v1"]
+        );
+        assert!(
+            apply(
+                &mut sim,
+                Command::Undock {
+                    vessel_id: "v2".into()
+                }
+            )
+            .is_err()
+        );
+        apply(
+            &mut sim,
+            Command::Dock {
+                vessel_id: "v2".into(),
+            },
+        )?;
+        assert_eq!(
+            VesselState::Docked { location: 2 },
+            sim.0.as_ref().unwrap().staged["v2"]
+        );
+        apply(&mut sim, Command::Tick)?;
+        assert_eq!(
+            VesselState::Docked { location: 2 },
+            sim.0.as_ref().unwrap().vessels["v2"]
+        );
+        apply(
+            &mut sim,
+            Command::Undock {
+                vessel_id: "v2".into(),
+            },
+        )?;
+        assert_eq!(
+            VesselState::Idle { location: 2 },
+            sim.0.as_ref().unwrap().staged["v2"],
         );
 
         Ok(())

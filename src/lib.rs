@@ -21,4 +21,10 @@ pub enum Command {
         #[serde(rename = "destination")]
         dest: usize,
     },
+    Dock {
+        vessel_id: String,
+    },
+    Undock {
+        vessel_id: String,
+    },
 }
