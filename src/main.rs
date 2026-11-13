@@ -1,4 +1,4 @@
-use fleet_sim::{Command, VesselLocation};
+use fleet_sim::{Cargo, Command, CowStr, VesselLocation};
 use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -26,18 +26,40 @@ struct Fleet {
     tick: usize,
     n: usize,
     travel_times: Vec<Vec<usize>>,
+    cargo_manifest: Vec<Vec<usize>>,
     vessels: HashMap<String, VesselState>,
     staged: HashMap<String, VesselState>,
 }
 
+fn apply_manifest(square: &mut Vec<Vec<usize>>, manifest: Vec<Cargo>) -> Result<(), CowStr> {
+    for &Cargo { dock, dest, .. } in &manifest {
+        if dock >= square.len() {
+            return Err(format!("unknown location {dock}"))?;
+        }
+        if dest >= square.len() {
+            return Err(format!("unknown destination {dest}"))?;
+        }
+    }
+    for Cargo {
+        dock,
+        dest,
+        quantity,
+    } in manifest
+    {
+        square[dock][dest] += quantity;
+    }
+    Ok(())
+}
+
 struct Sim(Option<Fleet>);
 
-fn apply(sim: &mut Sim, command: Command) -> Result<(), Cow<'static, str>> {
+fn apply(sim: &mut Sim, command: Command) -> Result<(), CowStr> {
     use Command::*;
     let Some(fleet) = sim.0.as_mut() else {
         let Init {
             travel_times,
             vessels,
+            cargo_manifest,
         } = command
         else {
             return Err("must call init first")?;
@@ -62,9 +84,12 @@ fn apply(sim: &mut Sim, command: Command) -> Result<(), Cow<'static, str>> {
                 return Err(format!("duplicate registration of vessel {vessel}"))?;
             }
         }
+        let mut manifest = vec![vec![0; rows]; rows];
+        apply_manifest(&mut manifest, cargo_manifest)?;
         sim.0 = Some(Fleet {
             tick: 0,
             travel_times,
+            cargo_manifest: manifest,
             n: rows,
             vessels: locations.clone(),
             staged: locations,
@@ -75,7 +100,7 @@ fn apply(sim: &mut Sim, command: Command) -> Result<(), Cow<'static, str>> {
 
     match command {
         Init { .. } => Err("cannot call init again")?,
-        Tick => {
+        Tick { cargo_manifest } => {
             for (vessel, state) in &mut fleet.vessels {
                 let next = fleet.staged[vessel];
                 *state = next;
@@ -92,6 +117,7 @@ fn apply(sim: &mut Sim, command: Command) -> Result<(), Cow<'static, str>> {
                     *state = VesselState::Idle { location: to };
                 }
             }
+            apply_manifest(&mut fleet.cargo_manifest, cargo_manifest)?;
             Ok(())
         }
         GetState => Ok(()),
