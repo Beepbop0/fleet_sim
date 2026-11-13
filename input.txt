@@ -1,0 +1,7 @@
+{"command":"init","parameters":{"travel_times":[[0,4,7],[4,0,3],[7,3,0]],"vessels":[{"vessel":"v1","location":0},{"vessel":"v2","location":2}]}}
+{"command":"set_destination","parameters":{"vessel":"v1","destination":2}}
+{"command":"set_destination","parameters":{"vessel":"v1","destination":1}}
+{"command":"tick"}
+{"command":"tick"}
+{"command":"tick"}
+{"command":"set_destination","parameters":{"vessel":"v1","destination":2}}
