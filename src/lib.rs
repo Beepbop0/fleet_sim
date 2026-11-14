@@ -28,12 +28,13 @@ pub enum Command {
     Init {
         travel_times: Vec<Vec<usize>>,
         vessels: Vec<VesselLocation>,
+        dock_throughput: Vec<usize>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         cargo_manifest: Vec<Cargo>,
     },
     #[serde(rename = "set_destination")]
     SetDest {
-        vessel: String,
+        vessel_id: String,
         #[serde(rename = "destination")]
         dest: usize,
     },
@@ -42,6 +43,23 @@ pub enum Command {
     },
     Undock {
         vessel_id: String,
+    },
+    Load {
+        vessel_id: String,
+        #[serde(rename = "destination")]
+        dest: usize,
+    },
+    Unload {
+        vessel_id: String,
+        #[serde(rename = "destination")]
+        dest: usize,
+    },
+    Swap {
+        vessel_id: String,
+        #[serde(rename = "load_destination")]
+        load_dest: usize,
+        #[serde(rename = "unload_destination")]
+        unload_dest: usize,
     },
 }
 

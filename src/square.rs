@@ -1,6 +1,7 @@
 use std::ops::{Index, IndexMut};
 use thiserror::Error;
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct Square {
     n: usize,
     inner: Vec<usize>,
@@ -49,10 +50,6 @@ impl Square {
 
     pub fn n(&self) -> usize {
         self.n
-    }
-
-    pub fn context(&self, arg: &str) -> Square {
-        todo!()
     }
 }
 
