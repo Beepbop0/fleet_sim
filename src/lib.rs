@@ -25,6 +25,9 @@ pub enum Command {
         cargo_manifest: Vec<Cargo>,
     },
     GetState,
+    GetStateAt {
+        tick: usize,
+    },
     Init {
         travel_times: Vec<Vec<usize>>,
         vessels: Vec<VesselLocation>,

@@ -131,10 +131,13 @@ impl<T> NonEmpty<T> {
     fn last_mut(&mut self) -> &mut T {
         self.rest.last_mut().unwrap_or(&mut self.head)
     }
+
+    fn tick(&self) -> usize {
+        self.rest.len()
+    }
 }
 
 struct Fleet {
-    tick: usize,
     travel_times: Square,
     dock_bandwidth: DockBandwidth,
     committed: NonEmpty<FleetState>,
@@ -213,7 +216,6 @@ fn sim_apply(sim: &mut Sim, command: Command) -> anyhow::Result<()> {
         };
         apply_manifest(&mut initial_state.cargo_manifest, &cargo_manifest)?;
         sim.0 = Some(Fleet {
-            tick: 0,
             travel_times,
             committed: NonEmpty::new(initial_state.clone()),
             planned: initial_state,
@@ -229,18 +231,18 @@ fn sim_apply(sim: &mut Sim, command: Command) -> anyhow::Result<()> {
 fn apply(fleet: &mut Fleet, command: Command) -> anyhow::Result<()> {
     use Command::*;
     match command {
-        GetState => Ok(()),
+        GetState | GetStateAt { .. } => Ok(()),
         Init { .. } => Err(anyhow!("cannot call init again")),
         Tick { cargo_manifest } => {
             fleet.committed.push(fleet.planned.clone());
-            fleet.tick += 1;
+            let tick = fleet.committed.tick();
             for Vessel { state, .. } in fleet.committed.last_mut().vessels.values_mut() {
                 if let &mut VesselState::Transit {
                     arrives_at_tick,
                     to,
                     ..
                 } = state
-                    && arrives_at_tick == fleet.tick
+                    && arrives_at_tick == tick
                 {
                     *state = VesselState::Idle { location: to };
                 }
@@ -255,7 +257,7 @@ fn apply(fleet: &mut Fleet, command: Command) -> anyhow::Result<()> {
             if dest >= n {
                 bail!("destination can only be set to 0..{n}");
             }
-            let tick = fleet.tick;
+            let tick = fleet.committed.tick();
             let (
                 Some(Vessel {
                     state: existing, ..
@@ -423,41 +425,76 @@ enum Status<'a> {
     Err { message: String },
 }
 
+enum View {
+    Planned,
+    LastCommitted,
+    CommittedAt(usize),
+}
+
+fn status(sim: &mut Sim, command: Command) -> Status<'_> {
+    let view = match &command {
+        Command::GetState | Command::SetDest { .. } => View::Planned,
+        Command::GetStateAt { tick } => View::CommittedAt(*tick),
+        _ => View::LastCommitted,
+    };
+
+    match sim_apply(sim, command) {
+        Ok(_) => (),
+        Err(e) => {
+            return Status::Err {
+                message: e.to_string(),
+            };
+        }
+    }
+
+    let Some(Fleet {
+        committed, planned, ..
+    }) = sim.0.as_ref()
+    else {
+        return Status::Err {
+            message: "must call init first".into(),
+        };
+    };
+
+    let state = match view {
+        View::Planned => planned,
+        View::LastCommitted => committed.last(),
+        View::CommittedAt(tick) => {
+            if tick == 0 {
+                &committed.head
+            } else {
+                let i = tick - 1;
+                if i >= committed.rest.len() {
+                    return Status::Err {
+                        message: format!(
+                            "tick {} is in the future (current tick: {}",
+                            tick,
+                            committed.tick()
+                        ),
+                    };
+                }
+                &committed.rest[i]
+            }
+        }
+    };
+
+    Status::Ok(WorldState {
+        vessels: &state.vessels,
+        tick: committed.tick(),
+    })
+}
+
 fn main() -> anyhow::Result<()> {
     let mut buf = String::new();
     let mut stdin = io::stdin().lock();
-    let mut state = Sim(None);
+    let mut sim = Sim(None);
     loop {
         buf.clear();
         if stdin.read_line(&mut buf)? == 0 {
             break;
         }
         let command: Command = serde_json::from_str(&buf[..])?;
-        let show_planned = matches!(&command, Command::GetState | Command::SetDest { .. });
-        let status = match sim_apply(&mut state, command) {
-            Ok(_) => {
-                let Some(Fleet {
-                    committed,
-                    planned,
-                    tick,
-                    ..
-                }) = state.0.as_ref()
-                else {
-                    panic!("received Ok when sim has not been initialized");
-                };
-                Status::Ok(WorldState {
-                    vessels: if show_planned {
-                        &planned.vessels
-                    } else {
-                        &committed.last().vessels
-                    },
-                    tick: *tick,
-                })
-            }
-            Err(e) => Status::Err {
-                message: e.to_string(),
-            },
-        };
+        let status = status(&mut sim, command);
 
         println!("{}", serde_json::to_string(&status)?);
     }
