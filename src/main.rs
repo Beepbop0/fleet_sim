@@ -110,18 +110,41 @@ struct FleetState {
     cargo_manifest: Square,
 }
 
+struct NonEmpty<T> {
+    head: T,
+    rest: Vec<T>,
+}
+
+impl<T> NonEmpty<T> {
+    fn new(head: T) -> Self {
+        Self { head, rest: vec![] }
+    }
+
+    fn push(&mut self, item: T) {
+        self.rest.push(item);
+    }
+
+    fn last(&self) -> &T {
+        self.rest.last().unwrap_or(&self.head)
+    }
+
+    fn last_mut(&mut self) -> &mut T {
+        self.rest.last_mut().unwrap_or(&mut self.head)
+    }
+}
+
 struct Fleet {
     tick: usize,
     travel_times: Square,
     dock_bandwidth: DockBandwidth,
-    committed: FleetState,
+    committed: NonEmpty<FleetState>,
     planned: FleetState,
 }
 
 impl Fleet {
     fn get_vessel(&mut self, vessel: &str) -> anyhow::Result<(&Vessel, &mut Vessel)> {
         match (
-            self.committed.vessels.get(vessel),
+            self.committed.last().vessels.get(vessel),
             self.planned.vessels.get_mut(vessel),
         ) {
             (Some(existing), Some(pending)) => Ok((existing, pending)),
@@ -192,7 +215,7 @@ fn sim_apply(sim: &mut Sim, command: Command) -> anyhow::Result<()> {
         sim.0 = Some(Fleet {
             tick: 0,
             travel_times,
-            committed: initial_state.clone(),
+            committed: NonEmpty::new(initial_state.clone()),
             planned: initial_state,
             dock_bandwidth: DockBandwidth::new(&dock_throughput[..]),
         });
@@ -209,9 +232,9 @@ fn apply(fleet: &mut Fleet, command: Command) -> anyhow::Result<()> {
         GetState => Ok(()),
         Init { .. } => Err(anyhow!("cannot call init again")),
         Tick { cargo_manifest } => {
-            fleet.committed = fleet.planned.clone();
+            fleet.committed.push(fleet.planned.clone());
             fleet.tick += 1;
-            for Vessel { state, .. } in fleet.committed.vessels.values_mut() {
+            for Vessel { state, .. } in fleet.committed.last_mut().vessels.values_mut() {
                 if let &mut VesselState::Transit {
                     arrives_at_tick,
                     to,
@@ -223,7 +246,7 @@ fn apply(fleet: &mut Fleet, command: Command) -> anyhow::Result<()> {
                 }
             }
             apply_manifest(&mut fleet.planned.cargo_manifest, &cargo_manifest)?;
-            fleet.committed.cargo_manifest = fleet.planned.cargo_manifest.clone();
+            fleet.committed.last_mut().cargo_manifest = fleet.planned.cargo_manifest.clone();
             fleet.dock_bandwidth.reset();
             Ok(())
         }
@@ -239,7 +262,7 @@ fn apply(fleet: &mut Fleet, command: Command) -> anyhow::Result<()> {
                 }),
                 Some(Vessel { state: pending, .. }),
             ) = (
-                fleet.committed.vessels.get(&vessel_id),
+                fleet.committed.last().vessels.get(&vessel_id),
                 fleet.planned.vessels.get_mut(&vessel_id),
             )
             else {
@@ -426,7 +449,7 @@ fn main() -> anyhow::Result<()> {
                     vessels: if show_planned {
                         &planned.vessels
                     } else {
-                        &committed.vessels
+                        &committed.last().vessels
                     },
                     tick: *tick,
                 })
@@ -506,7 +529,7 @@ mod tests {
                     to: 1,
                     arrives_at_tick: 4
                 },
-                fleet.committed.vessels["v1"].state,
+                fleet.committed.last().vessels["v1"].state,
             );
             assert!(
                 apply(
@@ -542,7 +565,7 @@ mod tests {
                 to: 2,
                 arrives_at_tick: 4 + 3,
             },
-            fleet.committed.vessels["v1"].state,
+            fleet.committed.last().vessels["v1"].state,
         );
         assert!(
             apply(
@@ -669,8 +692,8 @@ mod tests {
             },
         )?;
         apply(&mut fleet, Command::tick())?;
-        assert_eq!(0, fleet.committed.vessels["v2"].cargo[0]);
-        assert_eq!(0, fleet.committed.cargo_manifest[0][0]);
+        assert_eq!(0, fleet.committed.last().vessels["v2"].cargo[0]);
+        assert_eq!(0, fleet.committed.last().cargo_manifest[0][0]);
 
         Ok(())
     }
