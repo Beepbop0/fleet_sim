@@ -1,8 +1,8 @@
-use fleet_sim::{Cargo, Command, CowStr, VesselLocation};
+use anyhow::{Context, anyhow, bail};
+use fleet_sim::square::Square;
+use fleet_sim::{Cargo, Command, VesselLocation};
 use serde::Serialize;
-use std::borrow::Cow;
 use std::collections::HashMap;
-use std::error::Error;
 use std::io::{self, BufRead};
 
 #[derive(Debug, Serialize, Clone, Copy, PartialEq)]
@@ -24,20 +24,19 @@ enum VesselState {
 
 struct Fleet {
     tick: usize,
-    n: usize,
-    travel_times: Vec<Vec<usize>>,
-    cargo_manifest: Vec<Vec<usize>>,
+    travel_times: Square,
+    cargo_manifest: Square,
     vessels: HashMap<String, VesselState>,
     staged: HashMap<String, VesselState>,
 }
 
-fn apply_manifest(square: &mut Vec<Vec<usize>>, manifest: Vec<Cargo>) -> Result<(), CowStr> {
+fn apply_manifest(square: &mut Square, manifest: Vec<Cargo>) -> anyhow::Result<()> {
     for &Cargo { dock, dest, .. } in &manifest {
-        if dock >= square.len() {
-            return Err(format!("unknown location {dock}"))?;
+        if dock >= square.n() {
+            bail!("unknown location {dock}");
         }
-        if dest >= square.len() {
-            return Err(format!("unknown destination {dest}"))?;
+        if dest >= square.n() {
+            bail!("unknown destination {dest}");
         }
     }
     for Cargo {
@@ -53,7 +52,7 @@ fn apply_manifest(square: &mut Vec<Vec<usize>>, manifest: Vec<Cargo>) -> Result<
 
 struct Sim(Option<Fleet>);
 
-fn apply(sim: &mut Sim, command: Command) -> Result<(), CowStr> {
+fn apply(sim: &mut Sim, command: Command) -> anyhow::Result<()> {
     use Command::*;
     let Some(fleet) = sim.0.as_mut() else {
         let Init {
@@ -62,35 +61,30 @@ fn apply(sim: &mut Sim, command: Command) -> Result<(), CowStr> {
             cargo_manifest,
         } = command
         else {
-            return Err("must call init first")?;
+            bail!("must call init first");
         };
-        let rows = travel_times.len();
-        for (i, row) in travel_times.iter().enumerate() {
-            if row.len() != rows {
-                return Err(format!("travel times are not a {rows} x {rows} Matrix"))?;
-            } else if row[i] != 0 {
-                return Err("travel distance to self is not 0")?;
-            }
-        }
+
+        let travel_times = Square::try_from(travel_times)
+            .context("failed to convert travel times to square matrix")?;
+        let n = travel_times.n();
         let mut locations = HashMap::new();
         for VesselLocation { vessel, location } in vessels {
-            if location >= rows {
-                return Err(format!("invalid location {location} for vessel {vessel}"))?;
+            if location >= n {
+                bail!("invalid location {location} for vessel {vessel}");
             }
             if locations
                 .insert(vessel.clone(), VesselState::Idle { location })
                 .is_some()
             {
-                return Err(format!("duplicate registration of vessel {vessel}"))?;
+                bail!("duplicate registration of vessel {vessel}");
             }
         }
-        let mut manifest = vec![vec![0; rows]; rows];
+        let mut manifest = Square::zeros(n);
         apply_manifest(&mut manifest, cargo_manifest)?;
         sim.0 = Some(Fleet {
             tick: 0,
             travel_times,
             cargo_manifest: manifest,
-            n: rows,
             vessels: locations.clone(),
             staged: locations,
         });
@@ -99,7 +93,7 @@ fn apply(sim: &mut Sim, command: Command) -> Result<(), CowStr> {
     };
 
     match command {
-        Init { .. } => Err("cannot call init again")?,
+        Init { .. } => Err(anyhow!("cannot call init again")),
         Tick { cargo_manifest } => {
             for (vessel, state) in &mut fleet.vessels {
                 let next = fleet.staged[vessel];
@@ -122,14 +116,15 @@ fn apply(sim: &mut Sim, command: Command) -> Result<(), CowStr> {
         }
         GetState => Ok(()),
         SetDest { vessel, dest } => {
-            if dest >= fleet.n {
-                Err(format!("destination can only be set to 0..{}", fleet.n))?;
+            let n = fleet.travel_times.n();
+            if dest >= n {
+                bail!("destination can only be set to 0..{n}");
             }
             let tick = fleet.tick;
             let (Some(existing), Some(pending)) =
                 (fleet.vessels.get(&vessel), fleet.staged.get_mut(&vessel))
             else {
-                return Err(format!("unknown vessel {vessel}"))?;
+                bail!("unknown vessel {vessel}");
             };
             *pending = match *existing {
                 VesselState::Idle { location: from } => {
@@ -155,7 +150,7 @@ fn apply(sim: &mut Sim, command: Command) -> Result<(), CowStr> {
                         arrives_at_tick: tick + 1 + distance,
                     }
                 }
-                _ => return Err(format!("vessel {vessel} is not idle"))?,
+                _ => bail!("vessel {vessel} is not idle"),
             };
             Ok(())
         }
@@ -163,13 +158,13 @@ fn apply(sim: &mut Sim, command: Command) -> Result<(), CowStr> {
             let (Some(existing), Some(pending)) =
                 (fleet.vessels.get(&vessel), fleet.staged.get_mut(&vessel))
             else {
-                return Err(format!("unknown vessel {vessel}"))?;
+                bail!("unknown vessel {vessel}");
             };
             *pending = match *existing {
                 VesselState::Idle { location } | VesselState::Docked { location } => {
                     VesselState::Docked { location }
                 }
-                _ => return Err(format!("vessel {vessel} is not idle"))?,
+                _ => bail!("vessel {vessel} is not idle"),
             };
             Ok(())
         }
@@ -177,11 +172,11 @@ fn apply(sim: &mut Sim, command: Command) -> Result<(), CowStr> {
             let (Some(existing), Some(pending)) =
                 (fleet.vessels.get(&vessel), fleet.staged.get_mut(&vessel))
             else {
-                return Err(format!("unknown vessel {vessel}"))?;
+                bail!("unknown vessel {vessel}");
             };
             *pending = match *existing {
                 VesselState::Docked { location } => VesselState::Idle { location },
-                _ => return Err(format!("vessel {vessel} is not docked"))?,
+                _ => bail!("vessel {vessel} is not docked"),
             };
             Ok(())
         }
@@ -198,10 +193,10 @@ struct WorldState<'a> {
 #[serde(tag = "status", content = "payload", rename_all = "lowercase")]
 enum Status<'a> {
     Ok(WorldState<'a>),
-    Err { message: Cow<'static, str> },
+    Err { message: String },
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> anyhow::Result<()> {
     let mut buf = String::new();
     let mut stdin = io::stdin().lock();
     let mut state = Sim(None);
@@ -228,7 +223,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                     tick: *tick,
                 })
             }
-            Err(e) => Status::Err { message: e },
+            Err(e) => Status::Err {
+                message: e.to_string(),
+            },
         };
 
         println!("{}", serde_json::to_string(&status)?);
@@ -240,7 +237,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
     #[test]
-    fn application() -> Result<(), Cow<'static, str>> {
+    fn application() -> anyhow::Result<()> {
         let vessels = vec![
             VesselLocation {
                 vessel: "v1".into(),
@@ -256,6 +253,7 @@ mod tests {
         apply(
             &mut sim,
             Command::Init {
+                cargo_manifest: vec![],
                 travel_times: vec![vec![0, 4, 7], vec![4, 0, 3], vec![7, 3, 0]],
                 vessels,
             },
@@ -291,7 +289,7 @@ mod tests {
             sim.0.as_ref().unwrap().staged["v1"]
         );
         for _ in 0..3 {
-            apply(&mut sim, Command::Tick)?;
+            apply(&mut sim, Command::tick())?;
             assert_eq!(
                 VesselState::Transit {
                     from: 0,
@@ -308,7 +306,7 @@ mod tests {
                 dest: 2,
             },
         )?;
-        apply(&mut sim, Command::Tick)?;
+        apply(&mut sim, Command::tick())?;
         assert_eq!(
             VesselState::Transit {
                 from: 1,
@@ -336,7 +334,7 @@ mod tests {
             VesselState::Docked { location: 2 },
             sim.0.as_ref().unwrap().staged["v2"]
         );
-        apply(&mut sim, Command::Tick)?;
+        apply(&mut sim, Command::tick())?;
         assert_eq!(
             VesselState::Docked { location: 2 },
             sim.0.as_ref().unwrap().vessels["v2"]

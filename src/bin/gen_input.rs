@@ -16,6 +16,7 @@ fn main() -> serde_json::Result<()> {
         Command::Init {
             travel_times: vec![vec![0, 4, 7], vec![4, 0, 3], vec![7, 3, 0]],
             vessels,
+            cargo_manifest: vec![],
         },
         Command::SetDest {
             vessel: "v1".into(),
@@ -25,9 +26,9 @@ fn main() -> serde_json::Result<()> {
             vessel: "v1".into(),
             dest: 1,
         },
-        Command::Tick,
-        Command::Tick,
-        Command::Tick,
+        Command::tick(),
+        Command::tick(),
+        Command::tick(),
         Command::SetDest {
             vessel: "v1".into(),
             dest: 2,

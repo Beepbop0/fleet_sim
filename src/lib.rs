@@ -1,6 +1,6 @@
-use serde::{Deserialize, Serialize};
+pub mod square;
 
-pub type CowStr = std::borrow::Cow<'static, str>;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VesselLocation {
@@ -21,14 +21,14 @@ pub struct Cargo {
 #[serde(tag = "command", content = "parameters", rename_all = "lowercase")]
 pub enum Command {
     Tick {
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         cargo_manifest: Vec<Cargo>,
     },
     GetState,
     Init {
         travel_times: Vec<Vec<usize>>,
         vessels: Vec<VesselLocation>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         cargo_manifest: Vec<Cargo>,
     },
     #[serde(rename = "set_destination")]
@@ -43,4 +43,12 @@ pub enum Command {
     Undock {
         vessel_id: String,
     },
+}
+
+impl Command {
+    pub fn tick() -> Self {
+        Self::Tick {
+            cargo_manifest: vec![],
+        }
+    }
 }
