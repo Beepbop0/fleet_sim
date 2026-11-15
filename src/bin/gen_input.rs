@@ -1,4 +1,4 @@
-use fleet_sim::{Cargo, Command, VesselLocation};
+use fleet_sim::{Cargo, Command, Init, InitCommand, VesselLocation};
 
 fn main() -> serde_json::Result<()> {
     let vessels = vec![
@@ -12,13 +12,15 @@ fn main() -> serde_json::Result<()> {
         },
     ];
 
+    let init = InitCommand::Init(Init {
+        travel_times: vec![vec![0, 4, 7], vec![4, 0, 3], vec![7, 3, 0]],
+        dock_throughput: vec![2, 4, 1],
+        vessels,
+        cargo_manifest: vec![],
+    });
+    println!("{}", serde_json::to_string(&init)?);
+
     let commands = vec![
-        Command::Init {
-            travel_times: vec![vec![0, 4, 7], vec![4, 0, 3], vec![7, 3, 0]],
-            dock_throughput: vec![2, 4, 1],
-            vessels,
-            cargo_manifest: vec![],
-        },
         Command::Tick {
             cargo_manifest: vec![
                 Cargo {

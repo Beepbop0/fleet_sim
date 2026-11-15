@@ -1,4 +1,6 @@
 pub mod square;
+pub mod sim;
+pub mod nonempty;
 
 use serde::{Deserialize, Serialize};
 
