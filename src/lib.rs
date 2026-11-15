@@ -18,6 +18,21 @@ pub struct Cargo {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct Init {
+    pub travel_times: Vec<Vec<usize>>,
+    pub vessels: Vec<VesselLocation>,
+    pub dock_throughput: Vec<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cargo_manifest: Vec<Cargo>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "command", content = "parameters", rename_all = "lowercase")]
+pub enum InitCommand {
+    Init(Init),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "command", content = "parameters", rename_all = "lowercase")]
 pub enum Command {
     Tick {
@@ -27,13 +42,6 @@ pub enum Command {
     GetState,
     GetStateAt {
         tick: usize,
-    },
-    Init {
-        travel_times: Vec<Vec<usize>>,
-        vessels: Vec<VesselLocation>,
-        dock_throughput: Vec<usize>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        cargo_manifest: Vec<Cargo>,
     },
     #[serde(rename = "set_destination")]
     SetDest {
@@ -64,6 +72,13 @@ pub enum Command {
         #[serde(rename = "unload_destination")]
         unload_dest: usize,
     },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum TopCommand {
+    Init(InitCommand),
+    Fleet(Command),
 }
 
 impl Command {

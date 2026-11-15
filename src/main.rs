@@ -1,6 +1,6 @@
 use anyhow::{Context, anyhow, bail};
 use fleet_sim::square::Square;
-use fleet_sim::{Cargo, Command, VesselLocation};
+use fleet_sim::{Cargo, Command, Init, InitCommand, TopCommand, VesselLocation};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::io::{self, BufRead};
@@ -110,6 +110,15 @@ struct FleetState {
     cargo_manifest: Square,
 }
 
+fn get_vessel_mut<'a>(
+    vessels: &'a mut HashMap<String, Vessel>,
+    vessel_id: &str,
+) -> anyhow::Result<&'a mut Vessel> {
+    vessels
+        .get_mut(vessel_id)
+        .with_context(|| format!("unknown vessel {vessel_id}"))
+}
+
 struct NonEmpty<T> {
     head: T,
     rest: Vec<T>,
@@ -176,63 +185,52 @@ fn apply_manifest(square: &mut Square, manifest: &[Cargo]) -> anyhow::Result<()>
     Ok(())
 }
 
-struct Sim(Option<Fleet>);
-
-fn sim_apply(sim: &mut Sim, command: Command) -> anyhow::Result<()> {
-    let Some(fleet) = sim.0.as_mut() else {
-        let Command::Init {
-            travel_times,
-            vessels,
-            dock_throughput,
-            cargo_manifest,
-        } = command
-        else {
-            bail!("must call init first");
-        };
-        let travel_times = Square::try_from(travel_times)
-            .context("failed to convert travel times to square matrix")?;
-        let n = travel_times.n();
-        let mut locations = HashMap::new();
-        for VesselLocation { vessel, location } in vessels {
-            if location >= n {
-                bail!("invalid location {location} for vessel {vessel}");
-            }
-            if locations
-                .insert(
-                    vessel.clone(),
-                    Vessel {
-                        state: VesselState::Idle { location },
-                        cargo: vec![0; n],
-                    },
-                )
-                .is_some()
-            {
-                bail!("duplicate registration of vessel {vessel}");
-            }
+fn init_fleet(init: Init) -> anyhow::Result<Fleet> {
+    let Init {
+        travel_times,
+        vessels,
+        dock_throughput,
+        cargo_manifest,
+    } = init;
+    let travel_times = Square::try_from(travel_times)
+        .context("failed to convert travel times to square matrix")?;
+    let n = travel_times.n();
+    let mut locations = HashMap::new();
+    for VesselLocation { vessel, location } in vessels {
+        if location >= n {
+            bail!("invalid location {location} for vessel {vessel}");
         }
-        let mut initial_state = FleetState {
-            vessels: locations,
-            cargo_manifest: Square::zeros(n),
-        };
-        apply_manifest(&mut initial_state.cargo_manifest, &cargo_manifest)?;
-        sim.0 = Some(Fleet {
-            travel_times,
-            committed: NonEmpty::new(initial_state.clone()),
-            planned: initial_state,
-            dock_bandwidth: DockBandwidth::new(&dock_throughput[..]),
-        });
-
-        return Ok(());
+        if locations
+            .insert(
+                vessel.clone(),
+                Vessel {
+                    state: VesselState::Idle { location },
+                    cargo: vec![0; n],
+                },
+            )
+            .is_some()
+        {
+            bail!("duplicate registration of vessel {vessel}");
+        }
+    }
+    let mut initial_state = FleetState {
+        vessels: locations,
+        cargo_manifest: Square::zeros(n),
     };
+    apply_manifest(&mut initial_state.cargo_manifest, &cargo_manifest)?;
 
-    apply(fleet, command)
+    Ok(Fleet {
+        travel_times,
+        committed: NonEmpty::new(initial_state.clone()),
+        planned: initial_state,
+        dock_bandwidth: DockBandwidth::new(&dock_throughput[..]),
+    })
 }
 
 fn apply(fleet: &mut Fleet, command: Command) -> anyhow::Result<()> {
     use Command::*;
     match command {
         GetState | GetStateAt { .. } => Ok(()),
-        Init { .. } => Err(anyhow!("cannot call init again")),
         Tick { cargo_manifest } => {
             fleet.committed.push(fleet.planned.clone());
             let tick = fleet.committed.tick();
@@ -323,12 +321,7 @@ fn apply(fleet: &mut Fleet, command: Command) -> anyhow::Result<()> {
             if destination >= fleet.planned.cargo_manifest.n() {
                 bail!("unknown dock {destination}");
             }
-            let pending = fleet
-                .planned
-                .vessels
-                .get_mut(&vessel_id)
-                .with_context(|| format!("unknown vessel {vessel_id}"))?;
-
+            let pending = get_vessel_mut(&mut fleet.planned.vessels, &vessel_id)?;
             let &VesselState::Docked { location: dock } = &pending.state else {
                 bail!("vessel {vessel_id} is not docked");
             };
@@ -349,11 +342,7 @@ fn apply(fleet: &mut Fleet, command: Command) -> anyhow::Result<()> {
             if destination >= fleet.planned.cargo_manifest.n() {
                 bail!("unknown dock {destination}");
             }
-            let pending = fleet
-                .planned
-                .vessels
-                .get_mut(&vessel_id)
-                .with_context(|| format!("unknown vessel {vessel_id}"))?;
+            let pending = get_vessel_mut(&mut fleet.planned.vessels, &vessel_id)?;
             let &VesselState::Docked { location: dock } = &pending.state else {
                 bail!("vessel {vessel_id} is not docked");
             };
@@ -380,11 +369,7 @@ fn apply(fleet: &mut Fleet, command: Command) -> anyhow::Result<()> {
                     bail!("unknown dock {dest}");
                 }
             }
-            let pending = fleet
-                .planned
-                .vessels
-                .get_mut(&vessel_id)
-                .with_context(|| format!("unknown vessel {vessel_id}"))?;
+            let pending = get_vessel_mut(&mut fleet.planned.vessels, &vessel_id)?;
             let &VesselState::Docked { location: dock } = &pending.state else {
                 bail!("vessel {vessel_id} is not docked");
             };
@@ -404,7 +389,7 @@ fn apply(fleet: &mut Fleet, command: Command) -> anyhow::Result<()> {
             *unload_amount -= 1;
             pending.cargo[load_dest] += 1;
             if dock != unload_dest {
-                fleet.planned.cargo_manifest[dock][load_dest] += 1;
+                fleet.planned.cargo_manifest[dock][unload_dest] += 1;
             }
 
             Ok(())
@@ -431,31 +416,12 @@ enum View {
     CommittedAt(usize),
 }
 
-fn status(sim: &mut Sim, command: Command) -> Status<'_> {
-    let view = match &command {
-        Command::GetState | Command::SetDest { .. } => View::Planned,
-        Command::GetStateAt { tick } => View::CommittedAt(*tick),
-        _ => View::LastCommitted,
-    };
-
-    match sim_apply(sim, command) {
-        Ok(_) => (),
-        Err(e) => {
-            return Status::Err {
-                message: e.to_string(),
-            };
-        }
-    }
-
-    let Some(Fleet {
-        committed, planned, ..
-    }) = sim.0.as_ref()
-    else {
-        return Status::Err {
-            message: "must call init first".into(),
-        };
-    };
-
+fn status(
+    Fleet {
+        planned, committed, ..
+    }: &Fleet,
+    view: View,
+) -> Status<'_> {
     let state = match view {
         View::Planned => planned,
         View::LastCommitted => committed.last(),
@@ -487,14 +453,43 @@ fn status(sim: &mut Sim, command: Command) -> Status<'_> {
 fn main() -> anyhow::Result<()> {
     let mut buf = String::new();
     let mut stdin = io::stdin().lock();
-    let mut sim = Sim(None);
+    let mut sim = None;
     loop {
         buf.clear();
         if stdin.read_line(&mut buf)? == 0 {
             break;
         }
-        let command: Command = serde_json::from_str(&buf[..])?;
-        let status = status(&mut sim, command);
+        let command: TopCommand = serde_json::from_str(&buf[..])?;
+        let status = match (command, sim.as_mut()) {
+            (TopCommand::Fleet(_), None) => Status::Err {
+                message: "must call init first".into(),
+            },
+            (TopCommand::Init(_), Some(_)) => Status::Err {
+                message: "already called init".into(),
+            },
+            (TopCommand::Init(InitCommand::Init(init)), None) => match init_fleet(init) {
+                Ok(fleet) => {
+                    sim = Some(fleet);
+                    status(sim.as_ref().unwrap(), View::LastCommitted)
+                }
+                Err(err) => Status::Err {
+                    message: err.to_string(),
+                },
+            },
+            (TopCommand::Fleet(command), Some(fleet)) => {
+                let view = match &command {
+                    Command::GetState | Command::SetDest { .. } => View::Planned,
+                    Command::GetStateAt { tick } => View::CommittedAt(*tick),
+                    _ => View::LastCommitted,
+                };
+                match apply(fleet, command) {
+                    Ok(_) => status(fleet, view),
+                    Err(err) => Status::Err {
+                        message: err.to_string(),
+                    },
+                }
+            }
+        };
 
         println!("{}", serde_json::to_string(&status)?);
     }
@@ -517,17 +512,12 @@ mod tests {
             },
         ];
 
-        let mut sim = Sim(None);
-        sim_apply(
-            &mut sim,
-            Command::Init {
-                cargo_manifest: vec![],
-                dock_throughput: vec![2, 4, 1],
-                travel_times: vec![vec![0, 4, 7], vec![4, 0, 3], vec![7, 3, 0]],
-                vessels,
-            },
-        )?;
-        let mut fleet = sim.0.unwrap();
+        let mut fleet = init_fleet(Init {
+            cargo_manifest: vec![],
+            dock_throughput: vec![2, 4, 1],
+            travel_times: vec![vec![0, 4, 7], vec![4, 0, 3], vec![7, 3, 0]],
+            vessels,
+        })?;
         apply(
             &mut fleet,
             Command::SetDest {
