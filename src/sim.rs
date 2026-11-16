@@ -74,13 +74,20 @@ pub struct DockThroughput {
 struct DockBandwidth(Vec<DockThroughput>);
 
 impl DockBandwidth {
-    fn new(throughput: &[usize]) -> Self {
-        Self(
+    fn new(throughput: &[usize]) -> anyhow::Result<Self> {
+        if let Some((location, _)) = throughput
+            .iter()
+            .enumerate()
+            .find(|(_, throughput)| **throughput == 0)
+        {
+            bail!("dock {location} must have throughput that is positive");
+        }
+        Ok(Self(
             throughput
                 .iter()
                 .map(|&limit| DockThroughput { limit, ops: 0 })
                 .collect(),
-        )
+        ))
     }
 
     fn reset(&mut self) {
@@ -150,12 +157,20 @@ fn get_vessel<'a>(
 }
 
 fn apply_manifest(square: &mut Square, manifest: &[Cargo]) -> anyhow::Result<()> {
-    for &Cargo { dock, dest, .. } in manifest {
+    for &Cargo {
+        dock,
+        dest,
+        quantity,
+    } in manifest
+    {
         if dock >= square.n() {
             bail!("unknown location {dock}");
         }
         if dest >= square.n() {
             bail!("unknown destination {dest}");
+        }
+        if quantity == 0 {
+            bail!("expected positive quantity of cargo");
         }
     }
     for &Cargo {
@@ -179,6 +194,13 @@ fn init_fleet(init: Init) -> anyhow::Result<Fleet> {
     let travel_times = Square::try_from(travel_times)
         .context("failed to convert travel times to square matrix")?;
     let n = travel_times.n();
+    for i in 0..n {
+        for j in 0..n {
+            if i != j && travel_times[i][j] == 0 {
+                bail!("expected non-zero travel time between locations");
+            }
+        }
+    }
     let mut locations = HashMap::new();
     for VesselLocation { vessel, location } in vessels {
         if location >= n {
@@ -197,6 +219,12 @@ fn init_fleet(init: Init) -> anyhow::Result<Fleet> {
             bail!("duplicate registration of vessel {vessel}");
         }
     }
+
+    if dock_throughput.len() != n {
+        bail!("expected {} entries: got {}", n, dock_throughput.len());
+    }
+    let dock_bandwidth = DockBandwidth::new(&dock_throughput[..]);
+
     let mut initial_state = FleetState {
         vessels: locations,
         cargo_manifest: Square::zeros(n),
@@ -207,7 +235,7 @@ fn init_fleet(init: Init) -> anyhow::Result<Fleet> {
         travel_times,
         committed: NonEmpty::new(initial_state.clone()),
         planned: initial_state,
-        dock_bandwidth: DockBandwidth::new(&dock_throughput[..]),
+        dock_bandwidth,
     })
 }
 
