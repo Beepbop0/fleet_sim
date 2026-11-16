@@ -85,7 +85,7 @@ fn parse(line: &str) -> anyhow::Result<TopCommand> {
                 cargo_manifest: fields.get(1).map_or(Ok(Vec::new()), |value| cargo(value))?,
             })
         }
-        "get_state" | "state" => exact(&fields, 1).and_then(|()| fleet(Command::GetState)),
+        "get_state" | "state" => exact(&fields, 1).and_then(|()| fleet(Command::GetState {})),
         "get_state_at" | "state_at" => {
             exact(&fields, 2)?;
             fleet(Command::GetStateAt {

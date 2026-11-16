@@ -30,18 +30,33 @@ pub struct Init {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "command", content = "parameters", rename_all = "lowercase")]
+#[serde(tag = "command", content = "parameters", rename_all = "snake_case")]
 pub enum InitCommand {
     Init(Init),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "command", content = "parameters", rename_all = "snake_case")]
+pub enum TickCommand {
+    Tick(Tick),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Tick {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    cargo_manifest: Vec<Cargo>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FleetCommand {
+    Advance(TickCommand),
+    Planned(Command),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "command", content = "parameters", rename_all = "snake_case")]
 pub enum Command {
-    Tick {
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        cargo_manifest: Vec<Cargo>,
-    },
     GetState {},
     GetStateAt {
         tick: usize,
@@ -81,13 +96,13 @@ pub enum Command {
 #[serde(untagged)]
 pub enum TopCommand {
     Init(InitCommand),
-    Fleet(Command),
+    Fleet(FleetCommand),
 }
 
-impl Command {
+impl FleetCommand {
     pub fn tick() -> Self {
-        Self::Tick {
+        Self::Advance(TickCommand::Tick(Tick {
             cargo_manifest: vec![],
-        }
+        }))
     }
 }

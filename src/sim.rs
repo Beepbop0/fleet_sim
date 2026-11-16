@@ -1,6 +1,6 @@
 use crate::nonempty::NonEmpty;
 use crate::square::Square;
-use crate::{Cargo, Command, Init, VesselLocation};
+use crate::{Cargo, Command, FleetCommand, Init, Tick, TickCommand, VesselLocation};
 use anyhow::{Context, anyhow, bail};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -125,20 +125,21 @@ pub struct Fleet {
     committed: NonEmpty<FleetState>,
     planned: FleetState,
 }
+pub struct FleetView<'a> {
+    travel_times: &'a Square,
+    dock_bandwidth: &'a mut DockBandwidth,
+    committed: &'a FleetState,
+    planned: &'a mut FleetState,
+}
 
-impl Fleet {
-    fn get_vessel(&mut self, vessel: &str) -> anyhow::Result<(&Vessel, &mut Vessel)> {
-        match (
-            self.committed.last().vessels.get(vessel),
-            self.planned.vessels.get_mut(vessel),
-        ) {
-            (Some(existing), Some(pending)) => Ok((existing, pending)),
-            _ => Err(anyhow!("unknown vessel {vessel}")),
-        }
-    }
-
-    fn tick(&self) -> usize {
-        self.committed.rest().len()
+fn get_vessel<'a>(
+    committed: &'a HashMap<String, Vessel>,
+    planned: &'a mut HashMap<String, Vessel>,
+    vessel: &str,
+) -> anyhow::Result<(&'a Vessel, &'a mut Vessel)> {
+    match (committed.get(vessel), planned.get_mut(vessel)) {
+        (Some(existing), Some(pending)) => Ok((existing, pending)),
+        _ => Err(anyhow!("unknown vessel {vessel}")),
     }
 }
 
@@ -204,14 +205,20 @@ fn init_fleet(init: Init) -> anyhow::Result<Fleet> {
     })
 }
 
-fn apply(fleet: &mut Fleet, command: Command) -> anyhow::Result<()> {
-    use Command::*;
+fn apply(
+    Fleet {
+        committed,
+        planned,
+        dock_bandwidth,
+        travel_times,
+    }: &mut Fleet,
+    command: FleetCommand,
+) -> anyhow::Result<()> {
     match command {
-        GetState {} | GetStateAt { .. } => Ok(()),
-        Tick { cargo_manifest } => {
-            apply_manifest(&mut fleet.planned.cargo_manifest, &cargo_manifest)?;
-            let tick = fleet.tick() + 1;
-            for Vessel { state, .. } in fleet.planned.vessels.values_mut() {
+        FleetCommand::Advance(TickCommand::Tick(Tick { cargo_manifest })) => {
+            apply_manifest(&mut planned.cargo_manifest, &cargo_manifest)?;
+            let tick = committed.rest_len() + 1;
+            for Vessel { state, .. } in planned.vessels.values_mut() {
                 if let &mut VesselState::Transit {
                     arrives_at_tick,
                     to,
@@ -222,25 +229,54 @@ fn apply(fleet: &mut Fleet, command: Command) -> anyhow::Result<()> {
                     *state = VesselState::Idle { location: to };
                 }
             }
-            fleet.committed.push(fleet.planned.clone());
-            fleet.dock_bandwidth.reset();
+            apply_manifest(&mut planned.cargo_manifest, &cargo_manifest)?;
+            committed.push(planned.clone());
+            dock_bandwidth.reset();
             Ok(())
         }
+        FleetCommand::Planned(command) => apply_planned(
+            FleetView {
+                committed: committed.last(),
+                planned,
+                dock_bandwidth,
+                travel_times,
+            },
+            command,
+            committed.rest_len(),
+        ),
+    }
+}
+
+fn apply_planned(
+    FleetView {
+        committed: FleetState {
+            vessels: committed, ..
+        },
+        planned:
+            FleetState {
+                vessels: planned,
+                cargo_manifest: planned_cargo,
+            },
+        travel_times,
+        dock_bandwidth,
+    }: FleetView<'_>,
+    command: Command,
+    tick: usize,
+) -> anyhow::Result<()> {
+    use Command::*;
+    match command {
+        GetState {} | GetStateAt { .. } => Ok(()),
         SetDest { vessel_id, dest } => {
-            let n = fleet.travel_times.n();
+            let n = travel_times.n();
             if dest >= n {
                 bail!("destination can only be set to 0..{n}");
             }
-            let tick = fleet.tick();
             let (
                 Some(Vessel {
                     state: existing, ..
                 }),
                 Some(Vessel { state: pending, .. }),
-            ) = (
-                fleet.committed.last().vessels.get(&vessel_id),
-                fleet.planned.vessels.get_mut(&vessel_id),
-            )
+            ) = (committed.get(&vessel_id), planned.get_mut(&vessel_id))
             else {
                 bail!("unknown vessel {vessel_id}");
             };
@@ -249,7 +285,7 @@ fn apply(fleet: &mut Fleet, command: Command) -> anyhow::Result<()> {
                     if from == dest {
                         return Ok(());
                     }
-                    let distance = fleet.travel_times[from][dest];
+                    let distance = travel_times[from][dest];
                     VesselState::Transit {
                         from,
                         to: dest,
@@ -261,7 +297,7 @@ fn apply(fleet: &mut Fleet, command: Command) -> anyhow::Result<()> {
             Ok(())
         }
         Dock { vessel_id } => {
-            let (existing, pending) = fleet.get_vessel(&vessel_id)?;
+            let (existing, pending) = get_vessel(committed, planned, &vessel_id)?;
             pending.state = match existing.state {
                 VesselState::Idle { location } | VesselState::Docked { location } => {
                     VesselState::Docked { location }
@@ -270,11 +306,11 @@ fn apply(fleet: &mut Fleet, command: Command) -> anyhow::Result<()> {
             };
             Ok(())
         }
-        Undock { vessel_id: vessel } => {
-            let (existing, pending) = fleet.get_vessel(&vessel)?;
+        Undock { vessel_id } => {
+            let (existing, pending) = get_vessel(committed, planned, &vessel_id)?;
             pending.state = match existing.state {
                 VesselState::Docked { location } => VesselState::Idle { location },
-                _ => bail!("vessel {vessel} is not docked"),
+                _ => bail!("vessel {vessel_id} is not docked"),
             };
             Ok(())
         }
@@ -282,15 +318,15 @@ fn apply(fleet: &mut Fleet, command: Command) -> anyhow::Result<()> {
             vessel_id,
             dest: destination,
         } => {
-            if destination >= fleet.planned.cargo_manifest.n() {
+            if destination >= planned_cargo.n() {
                 bail!("unknown dock {destination}");
             }
-            let pending = get_vessel_mut(&mut fleet.planned.vessels, &vessel_id)?;
-            let &VesselState::Docked { location: dock } = &pending.state else {
+            let (existing, pending) = get_vessel(committed, planned, &vessel_id)?;
+            let &VesselState::Docked { location: dock } = &existing.state else {
                 bail!("vessel {vessel_id} is not docked");
             };
-            fleet.dock_bandwidth.add_op(dock)?;
-            let items = &mut fleet.planned.cargo_manifest[dock][destination];
+            dock_bandwidth.add_op(dock)?;
+            let items = &mut planned_cargo[dock][destination];
             if *items == 0 {
                 bail!("no cargo to load from location {dock} destined to {destination}");
             }
@@ -303,14 +339,14 @@ fn apply(fleet: &mut Fleet, command: Command) -> anyhow::Result<()> {
             vessel_id,
             dest: destination,
         } => {
-            if destination >= fleet.planned.cargo_manifest.n() {
+            if destination >= planned_cargo.n() {
                 bail!("unknown dock {destination}");
             }
-            let pending = get_vessel_mut(&mut fleet.planned.vessels, &vessel_id)?;
-            let &VesselState::Docked { location: dock } = &pending.state else {
+            let (existing, pending) = get_vessel(committed, planned, &vessel_id)?;
+            let &VesselState::Docked { location: dock } = &existing.state else {
                 bail!("vessel {vessel_id} is not docked");
             };
-            fleet.dock_bandwidth.add_op(dock)?;
+            dock_bandwidth.add_op(dock)?;
             let items = &mut pending.cargo[destination];
             if *items == 0 {
                 bail!("no cargo on vessel {vessel_id} destined to {destination}");
@@ -318,7 +354,7 @@ fn apply(fleet: &mut Fleet, command: Command) -> anyhow::Result<()> {
 
             *items -= 1;
             if destination != dock {
-                fleet.planned.cargo_manifest[dock][destination] += 1;
+                planned_cargo[dock][destination] += 1;
             }
 
             Ok(())
@@ -329,17 +365,17 @@ fn apply(fleet: &mut Fleet, command: Command) -> anyhow::Result<()> {
             unload_dest,
         } => {
             for dest in [load_dest, unload_dest] {
-                if load_dest >= fleet.planned.cargo_manifest.n() {
+                if load_dest >= planned_cargo.n() {
                     bail!("unknown dock {dest}");
                 }
             }
-            let pending = get_vessel_mut(&mut fleet.planned.vessels, &vessel_id)?;
-            let &VesselState::Docked { location: dock } = &pending.state else {
+            let (existing, pending) = get_vessel(committed, planned, &vessel_id)?;
+            let &VesselState::Docked { location: dock } = &existing.state else {
                 bail!("vessel {vessel_id} is not docked");
             };
 
             // load/unload pre-conditions
-            let load_amount = &mut fleet.planned.cargo_manifest[dock][load_dest];
+            let load_amount = &mut planned_cargo[dock][load_dest];
             if *load_amount == 0 {
                 bail!("no cargo on dock {dock} destined to {load_dest}");
             }
@@ -347,13 +383,13 @@ fn apply(fleet: &mut Fleet, command: Command) -> anyhow::Result<()> {
             if *unload_amount == 0 {
                 bail!("no cargo on vessel {vessel_id} destined to {unload_dest}");
             }
-            fleet.dock_bandwidth.add_op(dock)?;
+            dock_bandwidth.add_op(dock)?;
 
             *load_amount -= 1;
             *unload_amount -= 1;
             pending.cargo[load_dest] += 1;
             if dock != unload_dest {
-                fleet.planned.cargo_manifest[dock][unload_dest] += 1;
+                planned_cargo[dock][unload_dest] += 1;
             }
 
             Ok(())

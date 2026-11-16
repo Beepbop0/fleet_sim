@@ -23,4 +23,8 @@ impl<T> NonEmpty<T> {
     pub fn rest(&self) -> &[T] {
         &self.rest
     }
+
+    pub fn rest_len(&self) -> usize {
+        self.rest.len()
+    }
 }
