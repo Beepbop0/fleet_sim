@@ -1,4 +1,7 @@
-use fleet_sim::{InitCommand, TopCommand, Command, sim::{Fleet, View, Status}};
+use fleet_sim::{
+    Command, InitCommand, TopCommand,
+    sim::{Fleet, Status, View},
+};
 use std::io::{self, BufRead};
 
 fn main() -> anyhow::Result<()> {
@@ -29,7 +32,7 @@ fn main() -> anyhow::Result<()> {
             },
             (TopCommand::Fleet(command), Some(fleet)) => {
                 let view = match &command {
-                    Command::GetState | Command::SetDest { .. } => View::Planned,
+                    Command::GetState {} | Command::SetDest { .. } => View::Planned,
                     Command::GetStateAt { tick } => View::CommittedAt(*tick),
                     _ => View::LastCommitted,
                 };

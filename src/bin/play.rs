@@ -162,7 +162,7 @@ fn execute(command: TopCommand, sim: &mut Option<Fleet>) -> Status<'_> {
                 };
             };
             let view = match &command {
-                Command::GetState | Command::SetDest { .. } => View::Planned,
+                Command::GetState {} | Command::SetDest { .. } => View::Planned,
                 Command::GetStateAt { tick } => View::CommittedAt(*tick),
                 _ => View::LastCommitted,
             };

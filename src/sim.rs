@@ -1,12 +1,12 @@
-use anyhow::{Context, anyhow, bail};
+use crate::nonempty::NonEmpty;
 use crate::square::Square;
-use crate::{Cargo, Command, Init,  VesselLocation};
+use crate::{Cargo, Command, Init, VesselLocation};
+use anyhow::{Context, anyhow, bail};
 use serde::Serialize;
 use std::collections::HashMap;
-use crate::nonempty::NonEmpty;
 
 #[derive(Debug, Serialize, Clone, Copy, PartialEq)]
-#[serde(tag = "state")]
+#[serde(tag = "state", rename_all = "lowercase")]
 pub enum VesselState {
     Idle {
         location: usize,
@@ -119,8 +119,6 @@ fn get_vessel_mut<'a>(
         .with_context(|| format!("unknown vessel {vessel_id}"))
 }
 
-
-
 pub struct Fleet {
     travel_times: Square,
     dock_bandwidth: DockBandwidth,
@@ -209,7 +207,7 @@ fn init_fleet(init: Init) -> anyhow::Result<Fleet> {
 fn apply(fleet: &mut Fleet, command: Command) -> anyhow::Result<()> {
     use Command::*;
     match command {
-        GetState | GetStateAt { .. } => Ok(()),
+        GetState {} | GetStateAt { .. } => Ok(()),
         Tick { cargo_manifest } => {
             fleet.committed.push(fleet.planned.clone());
             let tick = fleet.tick();
@@ -390,13 +388,17 @@ impl Fleet {
 pub struct WorldState<'a> {
     pub tick: usize,
     pub vessels: &'a HashMap<String, Vessel>,
+    pub cargo: Vec<Cargo>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "status", content = "payload", rename_all = "lowercase")]
 pub enum Status<'a> {
     Ok(WorldState<'a>),
-    Err { message: String },
+    #[serde(rename = "error")]
+    Err {
+        message: String,
+    },
 }
 
 pub enum View {
@@ -433,9 +435,24 @@ fn status(
         }
     };
 
+    let mut cargo = vec![];
+    let n = state.cargo_manifest.n();
+    for dock in 0..n {
+        for (dest, &quantity) in state.cargo_manifest[dock].iter().enumerate() {
+            if quantity > 0 {
+                cargo.push(Cargo {
+                    dock,
+                    dest,
+                    quantity,
+                });
+            }
+        }
+    }
+
     Status::Ok(WorldState {
         vessels: &state.vessels,
         tick: fleet.tick(),
+        cargo,
     })
 }
 
@@ -448,7 +465,7 @@ impl Fleet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn application() -> anyhow::Result<()> {
         let vessels = vec![

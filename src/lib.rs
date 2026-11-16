@@ -1,11 +1,12 @@
-pub mod square;
-pub mod sim;
 pub mod nonempty;
+pub mod sim;
+pub mod square;
 
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VesselLocation {
+    #[serde(rename = "id")]
     pub vessel: String,
     pub location: usize,
 }
@@ -35,13 +36,13 @@ pub enum InitCommand {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "command", content = "parameters", rename_all = "lowercase")]
+#[serde(tag = "command", content = "parameters", rename_all = "snake_case")]
 pub enum Command {
     Tick {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         cargo_manifest: Vec<Cargo>,
     },
-    GetState,
+    GetState {},
     GetStateAt {
         tick: usize,
     },
