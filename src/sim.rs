@@ -223,7 +223,7 @@ fn init_fleet(init: Init) -> anyhow::Result<Fleet> {
     if dock_throughput.len() != n {
         bail!("expected {} entries: got {}", n, dock_throughput.len());
     }
-    let dock_bandwidth = DockBandwidth::new(&dock_throughput[..]);
+    let dock_bandwidth = DockBandwidth::new(&dock_throughput[..])?;
 
     let mut initial_state = FleetState {
         vessels: locations,
@@ -448,10 +448,23 @@ pub enum Status<'a> {
     },
 }
 
+#[derive(Debug, PartialEq)]
 pub enum View {
     Planned,
     LastCommitted,
     CommittedAt(usize),
+}
+
+impl View {
+    pub fn for_command(command: &FleetCommand) -> Result<Self, String> {
+        match command {
+            FleetCommand::Advance(_) => Ok(Self::LastCommitted),
+            FleetCommand::Planned(Command::GetStateAt { tick }) => usize::try_from(*tick)
+                .map(Self::CommittedAt)
+                .map_err(|_| "tick must be non-negative".to_owned()),
+            FleetCommand::Planned(_) => Ok(Self::Planned),
+        }
+    }
 }
 
 fn status(
@@ -460,10 +473,11 @@ fn status(
     }: &Fleet,
     view: View,
 ) -> Status<'_> {
-    let state = match view {
-        View::Planned => planned,
-        View::LastCommitted => committed.last(),
-        View::CommittedAt(tick) => {
+    let (tick, state) = match view {
+        View::Planned => (committed.rest_len(), planned),
+        View::LastCommitted => (committed.rest_len(), committed.last()),
+        View::CommittedAt(tick) => (
+            tick,
             if tick == 0 {
                 &committed.head
             } else {
@@ -478,8 +492,8 @@ fn status(
                     };
                 }
                 &committed.rest[i]
-            }
-        }
+            },
+        ),
     };
 
     let mut cargo = vec![];
@@ -498,7 +512,7 @@ fn status(
 
     Status::Ok(WorldState {
         vessels: &state.vessels,
-        tick: committed.rest_len(),
+        tick,
         cargo,
     })
 }
@@ -512,6 +526,44 @@ impl Fleet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_views_follow_snapshot_semantics() {
+        assert_eq!(
+            View::for_command(&FleetCommand::Advance(Tick::Tick {
+                cargo_manifest: vec![],
+            })),
+            Ok(View::LastCommitted),
+        );
+        assert_eq!(
+            View::for_command(&FleetCommand::Planned(Command::Dock {
+                vessel_id: "v1".into(),
+            })),
+            Ok(View::Planned),
+        );
+        assert_eq!(
+            View::for_command(&FleetCommand::Planned(Command::GetStateAt { tick: 3 })),
+            Ok(View::CommittedAt(3)),
+        );
+        assert!(
+            View::for_command(&FleetCommand::Planned(Command::GetStateAt { tick: -1 })).is_err()
+        );
+    }
+
+    #[test]
+    fn historical_status_uses_requested_tick() -> anyhow::Result<()> {
+        let mut fleet = init_fleet(Init {
+            cargo_manifest: vec![],
+            dock_throughput: vec![1],
+            travel_times: vec![vec![0]],
+            vessels: vec![],
+        })?;
+        apply_tick(&mut fleet, vec![])?;
+
+        let json = serde_json::to_value(fleet.status(View::CommittedAt(0)))?;
+        assert_eq!(json["payload"]["tick"], 0);
+        Ok(())
+    }
 
     #[test]
     fn application() -> anyhow::Result<()> {
@@ -591,6 +643,11 @@ mod tests {
                 .is_err()
             );
         }
+        apply_tick(&mut fleet, vec![])?;
+        assert_eq!(
+            VesselState::Idle { location: 1 },
+            fleet.committed.last().vessels["v1"].state,
+        );
         apply(
             &mut fleet,
             Command::SetDest {
@@ -723,6 +780,7 @@ mod tests {
                 vessel_id: "v2".into(),
             },
         )?;
+        apply_tick(&mut fleet, vec![])?;
         apply(
             &mut fleet,
             Command::Unload {

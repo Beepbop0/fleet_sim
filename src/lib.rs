@@ -103,3 +103,25 @@ impl TopCommand {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_state_commands_from_specification() {
+        let get_state: TopCommand =
+            serde_json::from_str(r#"{"command":"get_state","parameters":{}}"#).unwrap();
+        assert!(matches!(
+            get_state,
+            TopCommand::Fleet(FleetCommand::Planned(Command::GetState {}))
+        ));
+
+        let get_state_at: TopCommand =
+            serde_json::from_str(r#"{"command":"get_state_at","parameters":{"tick":0}}"#).unwrap();
+        assert!(matches!(
+            get_state_at,
+            TopCommand::Fleet(FleetCommand::Planned(Command::GetStateAt { tick: 0 }))
+        ));
+    }
+}

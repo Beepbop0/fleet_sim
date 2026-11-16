@@ -161,20 +161,9 @@ fn execute(command: TopCommand, sim: &mut Option<Fleet>) -> Status<'_> {
                     message: "must call init first".into(),
                 };
             };
-            let view = match &command {
-                FleetCommand::Planned(Command::GetState {} | Command::SetDest { .. }) => {
-                    View::Planned
-                }
-                FleetCommand::Planned(Command::GetStateAt { tick }) => {
-                    if *tick >= 0 {
-                        View::CommittedAt(*tick as usize)
-                    } else {
-                        return Status::Err {
-                            message: "must provide positive tick".into(),
-                        };
-                    }
-                }
-                _ => View::LastCommitted,
+            let view = match View::for_command(&command) {
+                Ok(view) => view,
+                Err(message) => return Status::Err { message },
             };
             match fleet.apply(command) {
                 Ok(()) => fleet.status(view),

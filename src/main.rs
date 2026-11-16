@@ -1,5 +1,5 @@
 use fleet_sim::{
-    Command, FleetCommand, InitCommand, TopCommand,
+    InitCommand, TopCommand,
     sim::{Fleet, Status, View},
 };
 use std::io::{self, BufRead};
@@ -22,21 +22,9 @@ fn status<'a>(sim: &'a mut Option<Fleet>, command: TopCommand) -> Status<'a> {
             },
         },
         (TopCommand::Fleet(command), Some(fleet)) => {
-            let view = match &command {
-                FleetCommand::Planned(planned) => match planned {
-                    Command::GetState {} | Command::SetDest { .. } => View::Planned,
-                    Command::GetStateAt { tick } => {
-                        if *tick >= 0 {
-                            View::CommittedAt(*tick as usize)
-                        } else {
-                            return Status::Err {
-                                message: "tick must be positive".into(),
-                            };
-                        }
-                    }
-                    _ => View::LastCommitted,
-                },
-                fleet_sim::FleetCommand::Advance(_) => View::LastCommitted,
+            let view = match View::for_command(&command) {
+                Ok(view) => view,
+                Err(message) => return Status::Err { message },
             };
             match fleet.apply(command) {
                 Ok(_) => fleet.status(view),
