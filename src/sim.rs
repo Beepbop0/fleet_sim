@@ -93,12 +93,13 @@ impl DockBandwidth {
         let Some(DockThroughput { limit, ops }) = self.0.get_mut(dock) else {
             bail!("unknown dock {dock}");
         };
-        *ops += 1;
-        if ops > limit {
+        if ops >= limit {
+            let excess = ops + 1;
             bail!(
-                "transfer of {ops} operations exceed dock throughput of {limit} at location {dock}"
+                "transfer of {excess} operations exceed dock throughput of {limit} at location {dock}"
             );
         }
+        *ops += 1;
 
         Ok(())
     }
