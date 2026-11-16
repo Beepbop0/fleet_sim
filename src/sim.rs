@@ -209,9 +209,9 @@ fn apply(fleet: &mut Fleet, command: Command) -> anyhow::Result<()> {
     match command {
         GetState {} | GetStateAt { .. } => Ok(()),
         Tick { cargo_manifest } => {
-            fleet.committed.push(fleet.planned.clone());
-            let tick = fleet.tick();
-            for Vessel { state, .. } in fleet.committed.last_mut().vessels.values_mut() {
+            apply_manifest(&mut fleet.planned.cargo_manifest, &cargo_manifest)?;
+            let tick = fleet.tick() + 1;
+            for Vessel { state, .. } in fleet.planned.vessels.values_mut() {
                 if let &mut VesselState::Transit {
                     arrives_at_tick,
                     to,
@@ -222,8 +222,7 @@ fn apply(fleet: &mut Fleet, command: Command) -> anyhow::Result<()> {
                     *state = VesselState::Idle { location: to };
                 }
             }
-            apply_manifest(&mut fleet.planned.cargo_manifest, &cargo_manifest)?;
-            fleet.committed.last_mut().cargo_manifest = fleet.planned.cargo_manifest.clone();
+            fleet.committed.push(fleet.planned.clone());
             fleet.dock_bandwidth.reset();
             Ok(())
         }
