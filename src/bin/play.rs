@@ -1,6 +1,6 @@
 use anyhow::{Context, anyhow, bail};
 use fleet_sim::{
-    Cargo, Command, Init, InitCommand, TopCommand, VesselLocation,
+    Cargo, Command, FleetCommand, Init, InitCommand, Tick, TopCommand, VesselLocation,
     sim::{Fleet, Status, View},
 };
 use std::io::{self, BufRead};
@@ -44,7 +44,7 @@ fn parse(line: &str) -> anyhow::Result<TopCommand> {
         bail!("empty command");
     };
 
-    let fleet = |command| Ok(TopCommand::Fleet(command));
+    let fleet = |command| Ok(TopCommand::Fleet(FleetCommand::Planned(command)));
     match command.to_ascii_lowercase().as_str() {
         "init" => {
             if !(4..=5).contains(&fields.len()) {
@@ -81,9 +81,9 @@ fn parse(line: &str) -> anyhow::Result<TopCommand> {
             if fields.len() > 2 {
                 bail!("usage: tick [CARGO]");
             }
-            fleet(Command::Tick {
+            Ok(TopCommand::Fleet(FleetCommand::Advance(Tick::Tick {
                 cargo_manifest: fields.get(1).map_or(Ok(Vec::new()), |value| cargo(value))?,
-            })
+            })))
         }
         "get_state" | "state" => exact(&fields, 1).and_then(|()| fleet(Command::GetState {})),
         "get_state_at" | "state_at" => {
@@ -162,8 +162,10 @@ fn execute(command: TopCommand, sim: &mut Option<Fleet>) -> Status<'_> {
                 };
             };
             let view = match &command {
-                Command::GetState {} | Command::SetDest { .. } => View::Planned,
-                Command::GetStateAt { tick } => View::CommittedAt(*tick),
+                FleetCommand::Planned(Command::GetState {} | Command::SetDest { .. }) => {
+                    View::Planned
+                }
+                FleetCommand::Planned(Command::GetStateAt { tick }) => View::CommittedAt(*tick),
                 _ => View::LastCommitted,
             };
             match fleet.apply(command) {

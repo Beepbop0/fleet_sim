@@ -37,20 +37,17 @@ pub enum InitCommand {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "command", content = "parameters", rename_all = "snake_case")]
-pub enum TickCommand {
-    Tick(Tick),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Tick {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    cargo_manifest: Vec<Cargo>,
+pub enum Tick {
+    Tick {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cargo_manifest: Vec<Cargo>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum FleetCommand {
-    Advance(TickCommand),
+    Advance(Tick),
     Planned(Command),
 }
 
@@ -99,9 +96,9 @@ pub enum TopCommand {
     Fleet(FleetCommand),
 }
 
-impl FleetCommand {
+impl TopCommand {
     pub fn tick() -> Self {
-        Self::Advance(TickCommand::Tick(Tick {
+        TopCommand::Fleet(FleetCommand::Advance(Tick::Tick {
             cargo_manifest: vec![],
         }))
     }

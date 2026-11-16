@@ -1,6 +1,6 @@
 use crate::nonempty::NonEmpty;
 use crate::square::Square;
-use crate::{Cargo, Command, FleetCommand, Init, Tick, TickCommand, VesselLocation};
+use crate::{Cargo, Command, FleetCommand, Init, Tick, VesselLocation};
 use anyhow::{Context, anyhow, bail};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -94,7 +94,7 @@ impl DockBandwidth {
             bail!("unknown dock {dock}");
         };
         if ops >= limit {
-            let excess = ops + 1;
+            let excess = *ops + 1;
             bail!(
                 "transfer of {excess} operations exceed dock throughput of {limit} at location {dock}"
             );
@@ -111,26 +111,31 @@ struct FleetState {
     cargo_manifest: Square,
 }
 
-fn get_vessel_mut<'a>(
-    vessels: &'a mut HashMap<String, Vessel>,
-    vessel_id: &str,
-) -> anyhow::Result<&'a mut Vessel> {
-    vessels
-        .get_mut(vessel_id)
-        .with_context(|| format!("unknown vessel {vessel_id}"))
-}
-
 pub struct Fleet {
     travel_times: Square,
     dock_bandwidth: DockBandwidth,
     committed: NonEmpty<FleetState>,
     planned: FleetState,
 }
+
 pub struct FleetView<'a> {
     travel_times: &'a Square,
     dock_bandwidth: &'a mut DockBandwidth,
     committed: &'a FleetState,
     planned: &'a mut FleetState,
+    tick: usize,
+}
+
+impl<'a> From<&'a mut Fleet> for FleetView<'a> {
+    fn from(value: &'a mut Fleet) -> Self {
+        Self {
+            travel_times: &value.travel_times,
+            dock_bandwidth: &mut value.dock_bandwidth,
+            committed: value.committed.last(),
+            planned: &mut value.planned,
+            tick: value.committed.rest_len(),
+        }
+    }
 }
 
 fn get_vessel<'a>(
@@ -206,50 +211,43 @@ fn init_fleet(init: Init) -> anyhow::Result<Fleet> {
     })
 }
 
-fn apply(
+fn apply_fleet_cmd(fleet: &mut Fleet, command: FleetCommand) -> anyhow::Result<()> {
+    match command {
+        FleetCommand::Advance(Tick::Tick { cargo_manifest }) => apply_tick(fleet, cargo_manifest),
+        FleetCommand::Planned(command) => apply(FleetView::from(fleet), command),
+    }
+}
+
+fn apply_tick(
     Fleet {
         committed,
         planned,
         dock_bandwidth,
-        travel_times,
+        ..
     }: &mut Fleet,
-    command: FleetCommand,
+    cargo_manifest: Vec<Cargo>,
 ) -> anyhow::Result<()> {
-    match command {
-        FleetCommand::Advance(TickCommand::Tick(Tick { cargo_manifest })) => {
-            apply_manifest(&mut planned.cargo_manifest, &cargo_manifest)?;
-            let tick = committed.rest_len() + 1;
-            for Vessel { state, .. } in planned.vessels.values_mut() {
-                if let &mut VesselState::Transit {
-                    arrives_at_tick,
-                    to,
-                    ..
-                } = state
-                    && arrives_at_tick == tick
-                {
-                    *state = VesselState::Idle { location: to };
-                }
-            }
-            apply_manifest(&mut planned.cargo_manifest, &cargo_manifest)?;
-            committed.push(planned.clone());
-            dock_bandwidth.reset();
-            Ok(())
+    apply_manifest(&mut planned.cargo_manifest, &cargo_manifest)?;
+    let tick = committed.rest_len() + 1;
+    for Vessel { state, .. } in planned.vessels.values_mut() {
+        if let &mut VesselState::Transit {
+            arrives_at_tick,
+            to,
+            ..
+        } = state
+            && arrives_at_tick == tick
+        {
+            *state = VesselState::Idle { location: to };
         }
-        FleetCommand::Planned(command) => apply_planned(
-            FleetView {
-                committed: committed.last(),
-                planned,
-                dock_bandwidth,
-                travel_times,
-            },
-            command,
-            committed.rest_len(),
-        ),
     }
+    committed.push(planned.clone());
+    dock_bandwidth.reset();
+    Ok(())
 }
 
-fn apply_planned(
-    FleetView {
+fn apply<'a, I: Into<FleetView<'a>>>(view: I, command: Command) -> anyhow::Result<()> {
+    use Command::*;
+    let FleetView {
         committed: FleetState {
             vessels: committed, ..
         },
@@ -260,11 +258,8 @@ fn apply_planned(
             },
         travel_times,
         dock_bandwidth,
-    }: FleetView<'_>,
-    command: Command,
-    tick: usize,
-) -> anyhow::Result<()> {
-    use Command::*;
+        tick,
+    } = view.into();
     match command {
         GetState {} | GetStateAt { .. } => Ok(()),
         SetDest { vessel_id, dest } => {
@@ -366,7 +361,7 @@ fn apply_planned(
             unload_dest,
         } => {
             for dest in [load_dest, unload_dest] {
-                if load_dest >= planned_cargo.n() {
+                if dest >= planned_cargo.n() {
                     bail!("unknown dock {dest}");
                 }
             }
@@ -403,8 +398,8 @@ impl Fleet {
         init_fleet(init)
     }
 
-    pub fn apply(&mut self, command: Command) -> anyhow::Result<()> {
-        apply(self, command)
+    pub fn apply(&mut self, command: FleetCommand) -> anyhow::Result<()> {
+        apply_fleet_cmd(self, command)
     }
 }
 
@@ -432,7 +427,7 @@ pub enum View {
 }
 
 fn status(
-    fleet @ Fleet {
+    Fleet {
         planned, committed, ..
     }: &Fleet,
     view: View,
@@ -445,12 +440,12 @@ fn status(
                 &committed.head
             } else {
                 let i = tick - 1;
-                if i >= committed.rest.len() {
+                if i >= committed.rest_len() {
                     return Status::Err {
                         message: format!(
-                            "tick {} is in the future (current tick: {}",
+                            "tick {} is in the future (current tick: {})",
                             tick,
-                            fleet.tick()
+                            committed.rest_len(),
                         ),
                     };
                 }
@@ -475,7 +470,7 @@ fn status(
 
     Status::Ok(WorldState {
         vessels: &state.vessels,
-        tick: fleet.tick(),
+        tick: committed.rest_len(),
         cargo,
     })
 }
@@ -540,7 +535,7 @@ mod tests {
             fleet.planned.vessels["v1"].state,
         );
         for _ in 0..3 {
-            apply(&mut fleet, Command::tick())?;
+            apply_tick(&mut fleet, vec![])?;
             assert_eq!(
                 VesselState::Transit {
                     from: 0,
@@ -576,7 +571,7 @@ mod tests {
             },
         )?;
 
-        apply(&mut fleet, Command::tick())?;
+        apply_tick(&mut fleet, vec![])?;
         assert_eq!(
             VesselState::Transit {
                 from: 1,
@@ -604,22 +599,20 @@ mod tests {
             VesselState::Docked { location: 2 },
             fleet.planned.vessels["v2"].state,
         );
-        apply(
+        apply_tick(
             &mut fleet,
-            Command::Tick {
-                cargo_manifest: vec![
-                    Cargo {
-                        quantity: 1,
-                        dock: 0,
-                        dest: 2,
-                    },
-                    Cargo {
-                        quantity: 2,
-                        dock: 2,
-                        dest: 0,
-                    },
-                ],
-            },
+            vec![
+                Cargo {
+                    quantity: 1,
+                    dock: 0,
+                    dest: 2,
+                },
+                Cargo {
+                    quantity: 2,
+                    dock: 2,
+                    dest: 0,
+                },
+            ],
         )?;
 
         // v2 has no cargo to unload
@@ -637,7 +630,7 @@ mod tests {
                 .is_err()
             );
             assert_eq!(prev, fleet.planned);
-            apply(&mut fleet, Command::tick())?;
+            apply_tick(&mut fleet, vec![])?;
             if i > 0 {
                 let prev = fleet.planned.clone();
                 assert!(
@@ -651,7 +644,7 @@ mod tests {
                     .is_err()
                 );
                 assert_eq!(prev, fleet.planned);
-                apply(&mut fleet, Command::tick())?;
+                apply_tick(&mut fleet, vec![])?;
             }
         }
         apply(
@@ -673,7 +666,7 @@ mod tests {
             )
             .is_err()
         );
-        apply(&mut fleet, Command::tick())?;
+        apply_tick(&mut fleet, vec![])?;
 
         apply(
             &mut fleet,
@@ -685,7 +678,7 @@ mod tests {
             VesselState::Idle { location: 2 },
             fleet.planned.vessels["v2"].state
         );
-        apply(&mut fleet, Command::tick())?;
+        apply_tick(&mut fleet, vec![])?;
         apply(
             &mut fleet,
             Command::SetDest {
@@ -694,7 +687,7 @@ mod tests {
             },
         )?;
         for _ in 0..7 {
-            apply(&mut fleet, Command::tick())?;
+            apply_tick(&mut fleet, vec![])?;
         }
         apply(
             &mut fleet,
@@ -709,7 +702,7 @@ mod tests {
                 dest: 0,
             },
         )?;
-        apply(&mut fleet, Command::tick())?;
+        apply_tick(&mut fleet, vec![])?;
         assert_eq!(0, fleet.committed.last().vessels["v2"].cargo[0]);
         assert_eq!(0, fleet.committed.last().cargo_manifest[0][0]);
 
