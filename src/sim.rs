@@ -256,18 +256,6 @@ fn apply(fleet: &mut Fleet, command: Command) -> anyhow::Result<()> {
                         arrives_at_tick: tick + distance,
                     }
                 }
-                VesselState::Transit {
-                    arrives_at_tick,
-                    to,
-                    ..
-                } if arrives_at_tick == tick + 1 => {
-                    let distance = fleet.travel_times[to][dest];
-                    VesselState::Transit {
-                        from: to,
-                        to: dest,
-                        arrives_at_tick: tick + 1 + distance,
-                    }
-                }
                 _ => bail!("vessel {vessel_id} is not idle"),
             };
             Ok(())
