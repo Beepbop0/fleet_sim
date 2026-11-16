@@ -321,11 +321,11 @@ fn apply<'a, I: Into<FleetView<'a>>>(view: I, command: Command) -> anyhow::Resul
             let &VesselState::Docked { location: dock } = &existing.state else {
                 bail!("vessel {vessel_id} is not docked");
             };
-            dock_bandwidth.add_op(dock)?;
             let items = &mut planned_cargo[dock][destination];
             if *items == 0 {
                 bail!("no cargo to load from location {dock} destined to {destination}");
             }
+            dock_bandwidth.add_op(dock)?;
             pending.cargo[destination] += 1;
             *items -= 1;
 
@@ -342,11 +342,11 @@ fn apply<'a, I: Into<FleetView<'a>>>(view: I, command: Command) -> anyhow::Resul
             let &VesselState::Docked { location: dock } = &existing.state else {
                 bail!("vessel {vessel_id} is not docked");
             };
-            dock_bandwidth.add_op(dock)?;
             let items = &mut pending.cargo[destination];
             if *items == 0 {
                 bail!("no cargo on vessel {vessel_id} destined to {destination}");
             }
+            dock_bandwidth.add_op(dock)?;
 
             *items -= 1;
             if destination != dock {

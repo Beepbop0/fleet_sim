@@ -56,7 +56,7 @@ pub enum FleetCommand {
 pub enum Command {
     GetState {},
     GetStateAt {
-        tick: usize,
+        tick: isize,
     },
     #[serde(rename = "set_destination")]
     SetDest {

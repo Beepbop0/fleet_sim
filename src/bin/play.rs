@@ -165,7 +165,15 @@ fn execute(command: TopCommand, sim: &mut Option<Fleet>) -> Status<'_> {
                 FleetCommand::Planned(Command::GetState {} | Command::SetDest { .. }) => {
                     View::Planned
                 }
-                FleetCommand::Planned(Command::GetStateAt { tick }) => View::CommittedAt(*tick),
+                FleetCommand::Planned(Command::GetStateAt { tick }) => {
+                    if *tick >= 0 {
+                        View::CommittedAt(*tick as usize)
+                    } else {
+                        return Status::Err {
+                            message: "must provide positive tick".into(),
+                        };
+                    }
+                }
                 _ => View::LastCommitted,
             };
             match fleet.apply(command) {
