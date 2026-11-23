@@ -1,6 +1,7 @@
 use anyhow::{Context, anyhow, bail};
 use fleet_sim::{
-    Cargo, Command, FleetCommand, Init, InitCommand, Tick, TopCommand, VesselLocation,
+    Cargo, FleetCommand, Init, InitCommand, MutCommand, Tick, TopCommand, VesselLocation,
+    ViewCommand,
     sim::{Fleet, Status, View},
 };
 use std::io::{self, BufRead};
@@ -44,6 +45,7 @@ fn parse(line: &str) -> anyhow::Result<TopCommand> {
         bail!("empty command");
     };
 
+    let view = |command| Ok(TopCommand::Fleet(FleetCommand::View(command)));
     let fleet = |command| Ok(TopCommand::Fleet(FleetCommand::Planned(command)));
     match command.to_ascii_lowercase().as_str() {
         "init" => {
@@ -85,16 +87,16 @@ fn parse(line: &str) -> anyhow::Result<TopCommand> {
                 cargo_manifest: fields.get(1).map_or(Ok(Vec::new()), |value| cargo(value))?,
             })))
         }
-        "get_state" | "state" => exact(&fields, 1).and_then(|()| fleet(Command::GetState {})),
+        "get_state" | "state" => exact(&fields, 1).and_then(|()| view(ViewCommand::GetState {})),
         "get_state_at" | "state_at" => {
             exact(&fields, 2)?;
-            fleet(Command::GetStateAt {
+            view(ViewCommand::GetStateAt {
                 tick: fields[1].parse().context("invalid tick")?,
             })
         }
         "set_destination" | "set_dest" => {
             exact(&fields, 3)?;
-            fleet(Command::SetDest {
+            fleet(MutCommand::SetDest {
                 vessel_id: fields[1].into(),
                 dest: fields[2].parse().context("invalid destination")?,
             })
@@ -103,9 +105,9 @@ fn parse(line: &str) -> anyhow::Result<TopCommand> {
             exact(&fields, 2)?;
             let vessel_id = fields[1].into();
             fleet(if command.eq_ignore_ascii_case("dock") {
-                Command::Dock { vessel_id }
+                MutCommand::Dock { vessel_id }
             } else {
-                Command::Undock { vessel_id }
+                MutCommand::Undock { vessel_id }
             })
         }
         "load" | "unload" => {
@@ -113,14 +115,14 @@ fn parse(line: &str) -> anyhow::Result<TopCommand> {
             let vessel_id = fields[1].into();
             let dest = fields[2].parse().context("invalid destination")?;
             fleet(if command.eq_ignore_ascii_case("load") {
-                Command::Load { vessel_id, dest }
+                MutCommand::Load { vessel_id, dest }
             } else {
-                Command::Unload { vessel_id, dest }
+                MutCommand::Unload { vessel_id, dest }
             })
         }
         "swap" => {
             exact(&fields, 4)?;
-            fleet(Command::Swap {
+            fleet(MutCommand::Swap {
                 vessel_id: fields[1].into(),
                 load_dest: fields[2].parse().context("invalid load destination")?,
                 unload_dest: fields[3].parse().context("invalid unload destination")?,

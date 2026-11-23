@@ -1,6 +1,6 @@
 use crate::nonempty::NonEmpty;
 use crate::square::Square;
-use crate::{Cargo, Command, FleetCommand, Init, Tick, VesselLocation};
+use crate::{Cargo, FleetCommand, Init, MutCommand, Tick, VesselLocation, ViewCommand};
 use anyhow::{Context, anyhow, bail};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -241,6 +241,7 @@ fn init_fleet(init: Init) -> anyhow::Result<Fleet> {
 
 fn apply_fleet_cmd(fleet: &mut Fleet, command: FleetCommand) -> anyhow::Result<()> {
     match command {
+        FleetCommand::View(_) => Ok(()),
         FleetCommand::Advance(Tick::Tick { cargo_manifest }) => apply_tick(fleet, cargo_manifest),
         FleetCommand::Planned(command) => apply(FleetView::from(fleet), command),
     }
@@ -273,8 +274,8 @@ fn apply_tick(
     Ok(())
 }
 
-fn apply<'a, I: Into<FleetView<'a>>>(view: I, command: Command) -> anyhow::Result<()> {
-    use Command::*;
+fn apply<'a, I: Into<FleetView<'a>>>(view: I, command: MutCommand) -> anyhow::Result<()> {
+    use MutCommand::*;
     let FleetView {
         committed: FleetState {
             vessels: committed, ..
@@ -289,7 +290,6 @@ fn apply<'a, I: Into<FleetView<'a>>>(view: I, command: Command) -> anyhow::Resul
         tick,
     } = view.into();
     match command {
-        GetState {} | GetStateAt { .. } => Ok(()),
         SetDest { vessel_id, dest } => {
             let n = travel_times.n();
             if dest >= n {
@@ -459,10 +459,13 @@ impl View {
     pub fn for_command(command: &FleetCommand) -> Result<Self, String> {
         match command {
             FleetCommand::Advance(_) => Ok(Self::LastCommitted),
-            FleetCommand::Planned(Command::GetStateAt { tick }) => usize::try_from(*tick)
-                .map(Self::CommittedAt)
-                .map_err(|_| "tick must be non-negative".to_owned()),
-            FleetCommand::Planned(_) => Ok(Self::Planned),
+            FleetCommand::View(ViewCommand::GetStateAt { tick }) => match usize::try_from(*tick) {
+                Ok(tick) => Ok(Self::CommittedAt(tick)),
+                Err(_) => Err("tick must be non-negative".to_owned()),
+            },
+            FleetCommand::View(ViewCommand::GetState {}) | FleetCommand::Planned(_) => {
+                Ok(Self::Planned)
+            }
         }
     }
 }
@@ -536,17 +539,17 @@ mod tests {
             Ok(View::LastCommitted),
         );
         assert_eq!(
-            View::for_command(&FleetCommand::Planned(Command::Dock {
+            View::for_command(&FleetCommand::Planned(MutCommand::Dock {
                 vessel_id: "v1".into(),
             })),
             Ok(View::Planned),
         );
         assert_eq!(
-            View::for_command(&FleetCommand::Planned(Command::GetStateAt { tick: 3 })),
+            View::for_command(&FleetCommand::View(ViewCommand::GetStateAt { tick: 3 })),
             Ok(View::CommittedAt(3)),
         );
         assert!(
-            View::for_command(&FleetCommand::Planned(Command::GetStateAt { tick: -1 })).is_err()
+            View::for_command(&FleetCommand::View(ViewCommand::GetStateAt { tick: -1 })).is_err()
         );
     }
 
@@ -567,6 +570,7 @@ mod tests {
 
     #[test]
     fn application() -> anyhow::Result<()> {
+        use MutCommand::*;
         let vessels = vec![
             VesselLocation {
                 vessel: "v1".into(),
@@ -586,7 +590,7 @@ mod tests {
         })?;
         apply(
             &mut fleet,
-            Command::SetDest {
+            SetDest {
                 vessel_id: "v1".into(),
                 dest: 2,
             },
@@ -601,7 +605,7 @@ mod tests {
         );
         apply(
             &mut fleet,
-            Command::SetDest {
+            SetDest {
                 vessel_id: "v1".into(),
                 dest: 1,
             },
@@ -627,7 +631,7 @@ mod tests {
             assert!(
                 apply(
                     &mut fleet,
-                    Command::Dock {
+                    Dock {
                         vessel_id: "v1".into()
                     }
                 )
@@ -636,7 +640,7 @@ mod tests {
             assert!(
                 apply(
                     &mut fleet,
-                    Command::Undock {
+                    Undock {
                         vessel_id: "v1".into()
                     }
                 )
@@ -650,7 +654,7 @@ mod tests {
         );
         apply(
             &mut fleet,
-            Command::SetDest {
+            SetDest {
                 vessel_id: "v1".into(),
                 dest: 2,
             },
@@ -668,7 +672,7 @@ mod tests {
         assert!(
             apply(
                 &mut fleet,
-                Command::Undock {
+                Undock {
                     vessel_id: "v2".into()
                 }
             )
@@ -676,7 +680,7 @@ mod tests {
         );
         apply(
             &mut fleet,
-            Command::Dock {
+            Dock {
                 vessel_id: "v2".into(),
             },
         )?;
@@ -707,7 +711,7 @@ mod tests {
             assert!(
                 apply(
                     &mut fleet,
-                    Command::Unload {
+                    Unload {
                         vessel_id: "v2".into(),
                         dest: i,
                     }
@@ -721,7 +725,7 @@ mod tests {
                 assert!(
                     apply(
                         &mut fleet,
-                        Command::Load {
+                        Load {
                             vessel_id: "v2".into(),
                             dest: i
                         }
@@ -734,7 +738,7 @@ mod tests {
         }
         apply(
             &mut fleet,
-            Command::Load {
+            Load {
                 vessel_id: "v2".into(),
                 dest: 0,
             },
@@ -744,7 +748,7 @@ mod tests {
         assert!(
             apply(
                 &mut fleet,
-                Command::Load {
+                Load {
                     vessel_id: "v2".into(),
                     dest: 0,
                 }
@@ -755,7 +759,7 @@ mod tests {
 
         apply(
             &mut fleet,
-            Command::Undock {
+            Undock {
                 vessel_id: "v2".into(),
             },
         )?;
@@ -766,7 +770,7 @@ mod tests {
         apply_tick(&mut fleet, vec![])?;
         apply(
             &mut fleet,
-            Command::SetDest {
+            SetDest {
                 vessel_id: "v2".into(),
                 dest: 0,
             },
@@ -776,14 +780,14 @@ mod tests {
         }
         apply(
             &mut fleet,
-            Command::Dock {
+            Dock {
                 vessel_id: "v2".into(),
             },
         )?;
         apply_tick(&mut fleet, vec![])?;
         apply(
             &mut fleet,
-            Command::Unload {
+            Unload {
                 vessel_id: "v2".into(),
                 dest: 0,
             },

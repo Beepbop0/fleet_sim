@@ -45,19 +45,15 @@ pub enum Tick {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum FleetCommand {
-    Advance(Tick),
-    Planned(Command),
+#[serde(tag = "command", content = "parameters", rename_all = "snake_case")]
+pub enum ViewCommand {
+    GetState {},
+    GetStateAt { tick: isize },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "command", content = "parameters", rename_all = "snake_case")]
-pub enum Command {
-    GetState {},
-    GetStateAt {
-        tick: isize,
-    },
+pub enum MutCommand {
     #[serde(rename = "set_destination")]
     SetDest {
         vessel_id: String,
@@ -91,6 +87,14 @@ pub enum Command {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
+pub enum FleetCommand {
+    Advance(Tick),
+    View(ViewCommand),
+    Planned(MutCommand),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
 pub enum TopCommand {
     Init(InitCommand),
     Fleet(FleetCommand),
@@ -114,14 +118,14 @@ mod tests {
             serde_json::from_str(r#"{"command":"get_state","parameters":{}}"#).unwrap();
         assert!(matches!(
             get_state,
-            TopCommand::Fleet(FleetCommand::Planned(Command::GetState {}))
+            TopCommand::Fleet(FleetCommand::View(ViewCommand::GetState {}))
         ));
 
         let get_state_at: TopCommand =
             serde_json::from_str(r#"{"command":"get_state_at","parameters":{"tick":0}}"#).unwrap();
         assert!(matches!(
             get_state_at,
-            TopCommand::Fleet(FleetCommand::Planned(Command::GetStateAt { tick: 0 }))
+            TopCommand::Fleet(FleetCommand::View(ViewCommand::GetStateAt { tick: 0 }))
         ));
     }
 }
