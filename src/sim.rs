@@ -65,7 +65,7 @@ impl Serialize for Vessel {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CargoAction {
     Unload(usize),
     Load(usize),
@@ -75,7 +75,62 @@ pub enum CargoAction {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Copy)]
+enum CargoOp {
+    Load { destination: usize },
+    Unload { destination: usize },
+}
+
+impl CargoOp {
+    fn destination(self) -> usize {
+        match self {
+            Self::Load { destination } | Self::Unload { destination } => destination,
+        }
+    }
+}
+
+impl From<CargoOp> for CargoAction {
+    fn from(operation: CargoOp) -> Self {
+        match operation {
+            CargoOp::Load { destination } => Self::Load(destination),
+            CargoOp::Unload { destination } => Self::Unload(destination),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct CargoOps {
+    load: Option<CargoOp>,
+    unload: Option<CargoOp>,
+}
+
+impl From<CargoAction> for CargoOps {
+    fn from(action: CargoAction) -> Self {
+        match action {
+            CargoAction::Load(dest) => Self {
+                load: Some(CargoOp::Load { destination: dest }),
+                ..Self::default()
+            },
+            CargoAction::Unload(dest) => Self {
+                unload: Some(CargoOp::Unload { destination: dest }),
+                ..Self::default()
+            },
+            CargoAction::Swap {
+                load_dest,
+                unload_dest,
+            } => Self {
+                load: Some(CargoOp::Load {
+                    destination: load_dest,
+                }),
+                unload: Some(CargoOp::Unload {
+                    destination: unload_dest,
+                }),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct CargoEvent {
     vessel: String,
     dock: usize,
@@ -133,6 +188,9 @@ fn apply_manifest(square: &mut Square, manifest: &[Cargo]) -> anyhow::Result<()>
         }
         if dest >= square.n() {
             bail!("unknown destination {dest}");
+        }
+        if dock == dest {
+            bail!("cargo at location {dock} is already at its destination");
         }
         if quantity == 0 {
             bail!("expected positive quantity of cargo");
@@ -231,7 +289,7 @@ fn apply_fleet_cmd(fleet: &mut Fleet, command: FleetCommand) -> anyhow::Result<(
 
 fn apply_tick(fleet: &mut Fleet, manifest: &[Cargo]) -> anyhow::Result<()> {
     let mut next = fleet.committed.last().clone();
-    apply_events(&mut next, &fleet.planned);
+    apply_events(&mut next, &fleet.planned)?;
     apply_manifest(&mut next.cargo_manifest, manifest)?;
     let tick = fleet.committed.rest_len() + 1;
     for Vessel { state, .. } in next.vessels.values_mut() {
@@ -250,58 +308,162 @@ fn apply_tick(fleet: &mut Fleet, manifest: &[Cargo]) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+enum EventLogChange {
+    NoOp,
+    Add,
+    Edit { at: usize, kind: EventLogEdit },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EventLogEdit {
+    Remove,
+    ReplaceWith(CargoAction),
+    RemoveAndAdd(CargoAction),
+}
+
+fn reduce_actions(old: CargoAction, new: CargoAction, dock: usize) -> Option<EventLogEdit> {
+    use EventLogEdit::*;
+    let (old, new) = (CargoOps::from(old), CargoOps::from(new));
+    let old_load = old.load.map(CargoOp::destination);
+    let old_unload = old.unload.map(CargoOp::destination);
+    let new_load = new.load.map(CargoOp::destination);
+    let new_unload = new.unload.map(CargoOp::destination);
+    let cancel_load = old_load == new_unload && new_unload.is_some_and(|dest| dest != dock);
+    let cancel_unload = old_unload == new_load && old_unload.is_some_and(|dest| dest != dock);
+
+    match (cancel_load, cancel_unload) {
+        (false, false) => None,
+        (true, true) => Some(Remove),
+        (true, false) => Some(match (old.unload, new.load) {
+            (None, None) => Remove,
+            (Some(old), None) => ReplaceWith(old.into()),
+            (None, Some(new)) => RemoveAndAdd(new.into()),
+            (Some(old), Some(new)) => ReplaceWith(CargoAction::Swap {
+                load_dest: new.destination(),
+                unload_dest: old.destination(),
+            }),
+        }),
+        (false, true) => Some(match (old.load, new.unload) {
+            (None, None) => Remove,
+            (Some(old), None) => ReplaceWith(old.into()),
+            (None, Some(new)) => RemoveAndAdd(new.into()),
+            (Some(old), Some(new)) => ReplaceWith(CargoAction::Swap {
+                load_dest: old.destination(),
+                unload_dest: new.destination(),
+            }),
+        }),
+    }
+}
+
+fn reduce_cargo_event(event: &CargoEvent, events: &[Event]) -> EventLogChange {
+    if let CargoAction::Swap {
+        load_dest,
+        unload_dest,
+    } = event.action
+        && load_dest == unload_dest
+    {
+        return EventLogChange::NoOp;
+    }
+
+    events
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(at, candidate)| {
+            let Event::Cargo(candidate) = candidate else {
+                return None;
+            };
+            if candidate.vessel != event.vessel || candidate.dock != event.dock {
+                return None;
+            }
+
+            reduce_actions(candidate.action, event.action, event.dock)
+                .map(|kind| EventLogChange::Edit { at, kind })
+        })
+        .unwrap_or(EventLogChange::Add)
+}
+
 fn validate_action(
     vessel: String,
     action: CargoAction,
-    events: &[Event],
+    events: &mut Vec<Event>,
     throughput: &[usize],
     vessels: &HashMap<String, Vessel>,
     cargo_manifest: &Square,
-) -> anyhow::Result<CargoEvent> {
-    let &VesselState::Docked { location: dock } = &get_vessel(vessels, &vessel)?.state else {
+) -> anyhow::Result<()> {
+    let VesselState::Docked { .. } = get_vessel(vessels, &vessel)?.state else {
+        bail!("vessel {vessel} is not committed as docked");
+    };
+    let mut pending = FleetState {
+        vessels: vessels.clone(),
+        cargo_manifest: cargo_manifest.clone(),
+    };
+    apply_events(&mut pending, events)?;
+    let pending_vessel = get_vessel(&pending.vessels, &vessel)?;
+    let VesselState::Docked { location: dock } = pending_vessel.state else {
         bail!("vessel {vessel} is not docked");
     };
-    let existing_ops = events
-        .iter()
-        .filter(
-            |e| matches!(e, Event::Cargo(CargoEvent { dock: this_dock, .. }) if *this_dock == dock),
-        )
-        .count();
-    if let (excess, limit) = (existing_ops + 1, throughput[dock])
-        && excess > limit
-    {
-        bail!(
-            "transfer of {excess} operations exceed dock throughput of {limit} at location {dock}"
-        );
+
+    // see if we can consolidate our event log with this new cargo op
+    let event = CargoEvent {
+        vessel: vessel.clone(),
+        dock,
+        action,
+    };
+    let edit = reduce_cargo_event(&event, events);
+    let mut new_events = events.clone();
+    match edit {
+        EventLogChange::NoOp => (),
+        EventLogChange::Add => new_events.push(Event::Cargo(event)),
+        EventLogChange::Edit { at, kind } => match kind {
+            EventLogEdit::Remove => {
+                new_events.remove(at);
+            }
+            EventLogEdit::ReplaceWith(replace) => {
+                new_events[at] = Event::Cargo(CargoEvent {
+                    vessel: event.vessel,
+                    dock: event.dock,
+                    action: replace,
+                });
+            }
+            EventLogEdit::RemoveAndAdd(add) => {
+                new_events.remove(at);
+                new_events.push(Event::Cargo(CargoEvent {
+                    vessel: event.vessel,
+                    dock: event.dock,
+                    action: add,
+                }));
+            }
+        },
     }
 
     let mut pending = FleetState {
         vessels: vessels.clone(),
         cargo_manifest: cargo_manifest.clone(),
     };
-    apply_events(&mut pending, events);
-    match action {
-        CargoAction::Load(dest)
-        | CargoAction::Swap {
-            load_dest: dest, ..
-        } if pending.cargo_manifest[dock][dest] == 0 => {
-            bail!("no cargo to load from location {dock} destined to {dest}");
-        }
-        CargoAction::Unload(dest)
-        | CargoAction::Swap {
-            unload_dest: dest, ..
-        } if pending.vessels[&vessel].cargo[dest] == 0 => {
-            bail!("no cargo on vessel {vessel} destined to {dest}")
-        }
-        _ => Ok(CargoEvent {
-            vessel,
-            dock,
-            action,
-        }),
+    // replay new events and see if the cargo accounting still makes sense
+    apply_events(&mut pending, &new_events)?;
+    // see if ops accounting checks out with new events
+    let op_count = new_events
+        .iter()
+        .filter(
+            |e| matches!(e, Event::Cargo(CargoEvent { dock: this_dock, .. }) if *this_dock == dock),
+        )
+        .count();
+    if let limit = throughput[dock]
+        && op_count > limit
+    {
+        bail!(
+            "transfer of {op_count} operations exceed dock throughput of {limit} at location {dock}"
+        );
     }
+    *events = new_events;
+
+    Ok(())
 }
 
-fn apply_events(fleet_state: &mut FleetState, events: &[Event]) {
+fn apply_events(fleet_state: &mut FleetState, events: &[Event]) -> anyhow::Result<()> {
     for event in events {
         match event {
             Event::Vessel { id, state } => {
@@ -317,10 +479,16 @@ fn apply_events(fleet_state: &mut FleetState, events: &[Event]) {
                 let dock_cargo = &mut fleet_state.cargo_manifest[*dock];
                 match *action {
                     CargoAction::Load(dest) => {
+                        if dock_cargo[dest] == 0 {
+                            bail!("no cargo on dock {dock} destined to {dest}");
+                        }
                         vessel_cargo[dest] += 1;
                         dock_cargo[dest] -= 1;
                     }
                     CargoAction::Unload(dest) => {
+                        if vessel_cargo[dest] == 0 {
+                            bail!("no cargo on vessel {vessel} destined to {dest}");
+                        }
                         vessel_cargo[dest] -= 1;
                         if dest != *dock {
                             dock_cargo[dest] += 1;
@@ -330,6 +498,12 @@ fn apply_events(fleet_state: &mut FleetState, events: &[Event]) {
                         load_dest,
                         unload_dest,
                     } => {
+                        if vessel_cargo[unload_dest] == 0 {
+                            bail!("no cargo on vessel {vessel} destined to {unload_dest}");
+                        }
+                        if dock_cargo[load_dest] == 0 {
+                            bail!("no cargo on dock {dock} destined to {load_dest}");
+                        }
                         vessel_cargo[unload_dest] -= 1;
                         if unload_dest != *dock {
                             dock_cargo[unload_dest] += 1;
@@ -341,6 +515,7 @@ fn apply_events(fleet_state: &mut FleetState, events: &[Event]) {
             }
         }
     }
+    Ok(())
 }
 
 fn event<'a>(
@@ -379,6 +554,8 @@ fn event<'a>(
                 bail!("vessel {vessel_id} is not idle");
             };
             if from == dest {
+                planned
+                    .retain(|event| !matches!(event, Event::Vessel { id, .. } if id == &vessel_id));
                 return Ok(None);
             }
             let distance = travel_times[from][dest];
@@ -421,40 +598,46 @@ fn event<'a>(
                 _ => Err(anyhow!("vessel {vessel_id} is not docked")),
             }
         }
-        Load { vessel_id, dest } => validate_action(
-            vessel_id,
-            CargoAction::Load(dest),
-            planned,
-            dock_throughput,
-            committed,
-            cargo_manifest,
-        )
-        .map(|c| Some(Event::Cargo(c))),
-        Unload { vessel_id, dest } => validate_action(
-            vessel_id,
-            CargoAction::Unload(dest),
-            planned,
-            dock_throughput,
-            committed,
-            cargo_manifest,
-        )
-        .map(|c| Some(Event::Cargo(c))),
+        Load { vessel_id, dest } => {
+            validate_action(
+                vessel_id,
+                CargoAction::Load(dest),
+                planned,
+                dock_throughput,
+                committed,
+                cargo_manifest,
+            )?;
+            Ok(None)
+        }
+        Unload { vessel_id, dest } => {
+            validate_action(
+                vessel_id,
+                CargoAction::Unload(dest),
+                planned,
+                dock_throughput,
+                committed,
+                cargo_manifest,
+            )?;
+            Ok(None)
+        }
         Swap {
             vessel_id,
             load_dest,
             unload_dest,
-        } => validate_action(
-            vessel_id,
-            CargoAction::Swap {
-                load_dest,
-                unload_dest,
-            },
-            planned,
-            dock_throughput,
-            committed,
-            cargo_manifest,
-        )
-        .map(|c| Some(Event::Cargo(c))),
+        } => {
+            validate_action(
+                vessel_id,
+                CargoAction::Swap {
+                    load_dest,
+                    unload_dest,
+                },
+                planned,
+                dock_throughput,
+                committed,
+                cargo_manifest,
+            )?;
+            Ok(None)
+        }
     }
 }
 
@@ -516,7 +699,7 @@ fn status(
     let (tick, state) = match view {
         View::Planned => {
             let mut staged = committed.last().clone();
-            apply_events(&mut staged, planned);
+            apply_events(&mut staged, planned).expect("persisted an invalid event");
             (committed.rest_len(), Cow::Owned(staged))
         }
         View::LastCommitted => (committed.rest_len(), Cow::Borrowed(committed.last())),
@@ -702,8 +885,8 @@ mod tests {
     fn undock_culls_vessels_planned_cargo_operations() -> anyhow::Result<()> {
         let mut fleet = init_fleet(Init {
             cargo_manifest: vec![],
-            dock_throughput: vec![2],
-            travel_times: vec![vec![0]],
+            dock_throughput: vec![2, 1],
+            travel_times: vec![vec![0, 1], vec![1, 0]],
             vessels: vec![
                 VesselLocation {
                     vessel: "v1".into(),
@@ -723,7 +906,7 @@ mod tests {
         fleet.apply(FleetCommand::Advance(Tick::Tick {
             cargo_manifest: vec![Cargo {
                 dock: 0,
-                dest: 0,
+                dest: 1,
                 quantity: 3,
             }],
         }))?;
@@ -731,7 +914,7 @@ mod tests {
         for vessel_id in ["v1", "v2"] {
             fleet.apply(FleetCommand::Planned(MutCommand::Load {
                 vessel_id: vessel_id.into(),
-                dest: 0,
+                dest: 1,
             }))?;
         }
         fleet.apply(FleetCommand::Planned(MutCommand::Undock {
@@ -739,20 +922,493 @@ mod tests {
         }))?;
 
         let mut projected = fleet.committed.last().clone();
-        apply_events(&mut projected, &fleet.planned);
+        apply_events(&mut projected, &fleet.planned)?;
         assert_eq!(
             projected.vessels["v1"].state,
             VesselState::Idle { location: 0 }
         );
-        assert_eq!(projected.vessels["v1"].cargo[0], 0);
-        assert_eq!(projected.vessels["v2"].cargo[0], 1);
-        assert_eq!(projected.cargo_manifest[0][0], 2);
+        assert_eq!(projected.vessels["v1"].cargo[1], 0);
+        assert_eq!(projected.vessels["v2"].cargo[1], 1);
+        assert_eq!(projected.cargo_manifest[0][1], 2);
 
         // Removing v1's load also releases its share of dock throughput.
         fleet.apply(FleetCommand::Planned(MutCommand::Load {
             vessel_id: "v2".into(),
+            dest: 1,
+        }))?;
+        Ok(())
+    }
+
+    #[test]
+    fn ambiguous_command_sequences_rewrite_the_plan() -> anyhow::Result<()> {
+        let mut fleet = init_fleet(Init {
+            cargo_manifest: vec![Cargo {
+                dock: 0,
+                dest: 1,
+                quantity: 2,
+            }],
+            dock_throughput: vec![1, 1],
+            travel_times: vec![vec![0, 1], vec![1, 0]],
+            vessels: vec![VesselLocation {
+                vessel: "v1".into(),
+                location: 0,
+            }],
+        })?;
+        fleet.apply(FleetCommand::Planned(MutCommand::Dock {
+            vessel_id: "v1".into(),
+        }))?;
+        fleet.apply(FleetCommand::Advance(Tick::Tick {
+            cargo_manifest: vec![],
+        }))?;
+        fleet.apply(FleetCommand::Planned(MutCommand::Load {
+            vessel_id: "v1".into(),
+            dest: 1,
+        }))?;
+        fleet.apply(FleetCommand::Advance(Tick::Tick {
+            cargo_manifest: vec![],
+        }))?;
+
+        // Loading and then unloading the same cargo cancels both operations.
+        fleet.apply(FleetCommand::Planned(MutCommand::Load {
+            vessel_id: "v1".into(),
+            dest: 1,
+        }))?;
+        fleet.apply(FleetCommand::Planned(MutCommand::Unload {
+            vessel_id: "v1".into(),
+            dest: 1,
+        }))?;
+        assert!(fleet.planned.is_empty());
+
+        // The inverse ordering cancels too and releases the throughput slot.
+        fleet.apply(FleetCommand::Planned(MutCommand::Unload {
+            vessel_id: "v1".into(),
+            dest: 1,
+        }))?;
+        fleet.apply(FleetCommand::Planned(MutCommand::Load {
+            vessel_id: "v1".into(),
+            dest: 1,
+        }))?;
+        assert!(fleet.planned.is_empty());
+        fleet.apply(FleetCommand::Planned(MutCommand::Unload {
+            vessel_id: "v1".into(),
+            dest: 1,
+        }))?;
+        fleet.planned.clear();
+
+        fleet.apply(FleetCommand::Planned(MutCommand::Undock {
+            vessel_id: "v1".into(),
+        }))?;
+        for command in [
+            MutCommand::Load {
+                vessel_id: "v1".into(),
+                dest: 1,
+            },
+            MutCommand::Unload {
+                vessel_id: "v1".into(),
+                dest: 1,
+            },
+            MutCommand::Swap {
+                vessel_id: "v1".into(),
+                load_dest: 1,
+                unload_dest: 1,
+            },
+        ] {
+            assert_eq!(
+                fleet
+                    .apply(FleetCommand::Planned(command))
+                    .unwrap_err()
+                    .to_string(),
+                "vessel v1 is not docked",
+            );
+        }
+
+        fleet.apply(FleetCommand::Advance(Tick::Tick {
+            cargo_manifest: vec![],
+        }))?;
+        fleet.apply(FleetCommand::Planned(MutCommand::SetDest {
+            vessel_id: "v1".into(),
+            dest: 1,
+        }))?;
+        fleet.apply(FleetCommand::Planned(MutCommand::SetDest {
+            vessel_id: "v1".into(),
             dest: 0,
         }))?;
+        assert!(fleet.planned.is_empty());
+        assert_eq!(
+            fleet.committed.last().vessels["v1"].state,
+            VesselState::Idle { location: 0 },
+        );
+        Ok(())
+    }
+
+    fn cargo_test_state() -> FleetState {
+        let mut vessels = HashMap::new();
+        vessels.insert(
+            "v1".into(),
+            Vessel {
+                state: VesselState::Docked { location: 0 },
+                cargo: vec![0, 2, 2],
+            },
+        );
+        vessels.insert(
+            "v2".into(),
+            Vessel {
+                state: VesselState::Docked { location: 0 },
+                cargo: vec![0, 0, 0],
+            },
+        );
+        let mut cargo_manifest = Square::zeros(3);
+        cargo_manifest[0][1] = 2;
+        cargo_manifest[0][2] = 2;
+        FleetState {
+            vessels,
+            cargo_manifest,
+        }
+    }
+
+    fn cargo_event(vessel: &str, action: CargoAction) -> Event {
+        Event::Cargo(CargoEvent {
+            vessel: vessel.into(),
+            dock: 0,
+            action,
+        })
+    }
+
+    #[test]
+    fn cargo_reduction_undoes_the_latest_matching_command() {
+        let events = vec![
+            cargo_event("v1", CargoAction::Load(1)),
+            cargo_event("v2", CargoAction::Load(1)),
+            cargo_event("v1", CargoAction::Load(1)),
+        ];
+        let added = CargoEvent {
+            vessel: "v1".into(),
+            dock: 0,
+            action: CargoAction::Unload(1),
+        };
+
+        assert!(matches!(
+            reduce_cargo_event(&added, &events),
+            EventLogChange::Edit {
+                at: 2,
+                kind: EventLogEdit::Remove
+            }
+        ));
+    }
+
+    #[test]
+    fn inverse_cargo_operations_cancel_at_throughput_limit() -> anyhow::Result<()> {
+        let state = cargo_test_state();
+        let mut events = vec![cargo_event("v1", CargoAction::Load(1))];
+
+        validate_action(
+            "v1".into(),
+            CargoAction::Unload(1),
+            &mut events,
+            &[1, 1, 1],
+            &state.vessels,
+            &state.cargo_manifest,
+        )?;
+
+        assert!(events.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn rewrite_is_atomic_when_another_vessel_depends_on_cargo() {
+        let mut state = cargo_test_state();
+        state.cargo_manifest[0][1] = 0;
+        state.vessels.get_mut("v1").unwrap().cargo[1] = 1;
+        let mut events = vec![
+            cargo_event("v1", CargoAction::Unload(1)),
+            cargo_event("v2", CargoAction::Load(1)),
+        ];
+
+        let error = validate_action(
+            "v1".into(),
+            CargoAction::Load(1),
+            &mut events,
+            &[4, 4, 4],
+            &state.vessels,
+            &state.cargo_manifest,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "no cargo on dock 0 destined to 1");
+        assert_eq!(events.len(), 2, "a rejected rewrite must be atomic");
+    }
+
+    #[test]
+    fn rewrite_is_atomic_when_a_swap_depends_on_cargo() {
+        let mut state = cargo_test_state();
+        state.cargo_manifest[0][1] = 0;
+        state.vessels.get_mut("v1").unwrap().cargo[1] = 1;
+        state.vessels.get_mut("v1").unwrap().cargo[2] = 1;
+        let mut events = vec![
+            cargo_event("v1", CargoAction::Unload(1)),
+            cargo_event(
+                "v1",
+                CargoAction::Swap {
+                    load_dest: 1,
+                    unload_dest: 2,
+                },
+            ),
+        ];
+
+        let error = validate_action(
+            "v1".into(),
+            CargoAction::Load(1),
+            &mut events,
+            &[4, 4, 4],
+            &state.vessels,
+            &state.cargo_manifest,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "no cargo on dock 0 destined to 1");
+        assert_eq!(events.len(), 2, "a rejected rewrite must be atomic");
+    }
+
+    #[test]
+    fn cancelling_one_side_of_a_swap_preserves_the_other_side() -> anyhow::Result<()> {
+        let state = cargo_test_state();
+        let mut events = vec![cargo_event(
+            "v1",
+            CargoAction::Swap {
+                load_dest: 1,
+                unload_dest: 2,
+            },
+        )];
+
+        validate_action(
+            "v1".into(),
+            CargoAction::Unload(1),
+            &mut events,
+            &[4, 4, 4],
+            &state.vessels,
+            &state.cargo_manifest,
+        )?;
+
+        assert!(matches!(
+            events.as_slice(),
+            [Event::Cargo(CargoEvent {
+                vessel,
+                dock: 0,
+                action: CargoAction::Unload(2),
+            })] if vessel == "v1"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn partial_swap_reductions_preserve_the_unmatched_transfer() -> anyhow::Result<()> {
+        use CargoAction::*;
+
+        let cases = [
+            (
+                Load(1),
+                Swap {
+                    load_dest: 2,
+                    unload_dest: 1,
+                },
+                Load(2),
+            ),
+            (
+                Unload(1),
+                Swap {
+                    load_dest: 1,
+                    unload_dest: 2,
+                },
+                Unload(2),
+            ),
+            (
+                Swap {
+                    load_dest: 1,
+                    unload_dest: 2,
+                },
+                Load(2),
+                Load(1),
+            ),
+            (
+                Swap {
+                    load_dest: 1,
+                    unload_dest: 2,
+                },
+                Unload(1),
+                Unload(2),
+            ),
+        ];
+
+        for (existing, added, expected) in cases {
+            let state = cargo_test_state();
+            let mut events = vec![cargo_event("v1", existing)];
+            validate_action(
+                "v1".into(),
+                added,
+                &mut events,
+                &[4, 4, 4],
+                &state.vessels,
+                &state.cargo_manifest,
+            )?;
+            assert!(matches!(
+                events.as_slice(),
+                [Event::Cargo(CargoEvent { action, .. })] if *action == expected
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn chained_swaps_preserve_both_unmatched_transfers() -> anyhow::Result<()> {
+        let mut vessels = HashMap::new();
+        vessels.insert(
+            "v1".into(),
+            Vessel {
+                state: VesselState::Docked { location: 0 },
+                cargo: vec![0, 2, 2, 2],
+            },
+        );
+        let mut cargo_manifest = Square::zeros(4);
+        cargo_manifest[0][1] = 2;
+        cargo_manifest[0][2] = 2;
+        cargo_manifest[0][3] = 2;
+        let state = FleetState {
+            vessels,
+            cargo_manifest,
+        };
+        let mut events = vec![cargo_event(
+            "v1",
+            CargoAction::Swap {
+                load_dest: 1,
+                unload_dest: 2,
+            },
+        )];
+
+        validate_action(
+            "v1".into(),
+            CargoAction::Swap {
+                load_dest: 2,
+                unload_dest: 1,
+            },
+            &mut events,
+            &[4, 4, 4, 4],
+            &state.vessels,
+            &state.cargo_manifest,
+        )?;
+        assert!(events.is_empty(), "exact reverse swaps should cancel");
+
+        let mut events = vec![cargo_event(
+            "v1",
+            CargoAction::Swap {
+                load_dest: 1,
+                unload_dest: 2,
+            },
+        )];
+        validate_action(
+            "v1".into(),
+            CargoAction::Swap {
+                load_dest: 3,
+                unload_dest: 1,
+            },
+            &mut events,
+            &[4, 4, 4, 4],
+            &state.vessels,
+            &state.cargo_manifest,
+        )?;
+        assert!(matches!(
+            events.as_slice(),
+            [Event::Cargo(CargoEvent {
+                action: CargoAction::Swap {
+                    load_dest: 3,
+                    unload_dest: 2,
+                },
+                ..
+            })]
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn chained_swaps_preserve_an_unmatched_delivery() -> anyhow::Result<()> {
+        let mut state = cargo_test_state();
+        state.vessels.get_mut("v1").unwrap().cargo[0] = 1;
+        state.cargo_manifest[0][1] = 1;
+        state.cargo_manifest[0][2] = 1;
+        let mut events = vec![cargo_event(
+            "v1",
+            CargoAction::Swap {
+                load_dest: 1,
+                unload_dest: 0,
+            },
+        )];
+
+        validate_action(
+            "v1".into(),
+            CargoAction::Swap {
+                load_dest: 2,
+                unload_dest: 1,
+            },
+            &mut events,
+            &[4, 4, 4],
+            &state.vessels,
+            &state.cargo_manifest,
+        )?;
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [Event::Cargo(CargoEvent {
+                    action: CargoAction::Swap {
+                        load_dest: 2,
+                        unload_dest: 0,
+                    },
+                    ..
+                })]
+            ),
+            "{:?}",
+            events.as_slice()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cargo_manifest_at_its_destination_is_rejected() -> anyhow::Result<()> {
+        let init = Init {
+            cargo_manifest: vec![Cargo {
+                dock: 0,
+                dest: 0,
+                quantity: 3,
+            }],
+            dock_throughput: vec![1, 1],
+            travel_times: vec![vec![0, 1], vec![1, 0]],
+            vessels: vec![],
+        };
+        assert_eq!(
+            init_fleet(init).err().unwrap().to_string(),
+            "cargo at location 0 is already at its destination",
+        );
+
+        let mut fleet = init_fleet(Init {
+            cargo_manifest: vec![],
+            dock_throughput: vec![1, 1],
+            travel_times: vec![vec![0, 1], vec![1, 0]],
+            vessels: vec![],
+        })?;
+
+        let error = apply_tick(
+            &mut fleet,
+            &[Cargo {
+                dock: 1,
+                dest: 1,
+                quantity: 4,
+            }],
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "cargo at location 1 is already at its destination",
+        );
+        assert_eq!(fleet.committed.rest_len(), 0);
         Ok(())
     }
 
