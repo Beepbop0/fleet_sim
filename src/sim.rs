@@ -105,7 +105,7 @@ pub struct FleetView<'a> {
     travel_times: &'a Square,
     dock_throughput: &'a [usize],
     committed: &'a FleetState,
-    planned: &'a [Event],
+    planned: &'a mut Vec<Event>,
     tick: usize,
 }
 
@@ -115,7 +115,7 @@ impl<'a> From<&'a mut Fleet> for FleetView<'a> {
             travel_times: &value.travel_times,
             dock_throughput: &mut value.dock_throughput,
             committed: value.committed.last(),
-            planned: &value.planned,
+            planned: &mut value.planned,
             tick: value.committed.rest_len(),
         }
     }
@@ -406,10 +406,18 @@ fn event<'a>(
         Undock { vessel_id } => {
             let existing = get_vessel(committed, &vessel_id)?;
             match existing.state {
-                VesselState::Docked { location } => Ok(Some(Event::Vessel {
-                    id: vessel_id,
-                    state: VesselState::Idle { location },
-                })),
+                VesselState::Docked { location } => {
+                    planned.retain(|event| {
+                        !matches!(
+                            event,
+                            Event::Cargo(CargoEvent { vessel, .. }) if vessel == &vessel_id
+                        )
+                    });
+                    Ok(Some(Event::Vessel {
+                        id: vessel_id,
+                        state: VesselState::Idle { location },
+                    }))
+                }
                 _ => Err(anyhow!("vessel {vessel_id} is not docked")),
             }
         }
@@ -687,6 +695,64 @@ mod tests {
             assert_eq!(error.to_string(), "unknown location 1");
             assert!(fleet.planned.is_empty());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn undock_culls_vessels_planned_cargo_operations() -> anyhow::Result<()> {
+        let mut fleet = init_fleet(Init {
+            cargo_manifest: vec![],
+            dock_throughput: vec![2],
+            travel_times: vec![vec![0]],
+            vessels: vec![
+                VesselLocation {
+                    vessel: "v1".into(),
+                    location: 0,
+                },
+                VesselLocation {
+                    vessel: "v2".into(),
+                    location: 0,
+                },
+            ],
+        })?;
+        for vessel_id in ["v1", "v2"] {
+            fleet.apply(FleetCommand::Planned(MutCommand::Dock {
+                vessel_id: vessel_id.into(),
+            }))?;
+        }
+        fleet.apply(FleetCommand::Advance(Tick::Tick {
+            cargo_manifest: vec![Cargo {
+                dock: 0,
+                dest: 0,
+                quantity: 3,
+            }],
+        }))?;
+
+        for vessel_id in ["v1", "v2"] {
+            fleet.apply(FleetCommand::Planned(MutCommand::Load {
+                vessel_id: vessel_id.into(),
+                dest: 0,
+            }))?;
+        }
+        fleet.apply(FleetCommand::Planned(MutCommand::Undock {
+            vessel_id: "v1".into(),
+        }))?;
+
+        let mut projected = fleet.committed.last().clone();
+        apply_events(&mut projected, &fleet.planned);
+        assert_eq!(
+            projected.vessels["v1"].state,
+            VesselState::Idle { location: 0 }
+        );
+        assert_eq!(projected.vessels["v1"].cargo[0], 0);
+        assert_eq!(projected.vessels["v2"].cargo[0], 1);
+        assert_eq!(projected.cargo_manifest[0][0], 2);
+
+        // Removing v1's load also releases its share of dock throughput.
+        fleet.apply(FleetCommand::Planned(MutCommand::Load {
+            vessel_id: "v2".into(),
+            dest: 0,
+        }))?;
         Ok(())
     }
 
