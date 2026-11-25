@@ -75,56 +75,29 @@ pub enum CargoAction {
     },
 }
 
-#[derive(Clone, Copy)]
-enum CargoOp {
-    Load { destination: usize },
-    Unload { destination: usize },
-}
-
-impl CargoOp {
-    fn destination(self) -> usize {
-        match self {
-            Self::Load { destination } | Self::Unload { destination } => destination,
-        }
-    }
-}
-
-impl From<CargoOp> for CargoAction {
-    fn from(operation: CargoOp) -> Self {
-        match operation {
-            CargoOp::Load { destination } => Self::Load(destination),
-            CargoOp::Unload { destination } => Self::Unload(destination),
-        }
-    }
-}
-
 #[derive(Clone, Copy, Default)]
 struct CargoOps {
-    load: Option<CargoOp>,
-    unload: Option<CargoOp>,
+    load: Option<usize>,
+    unload: Option<usize>,
 }
 
 impl From<CargoAction> for CargoOps {
     fn from(action: CargoAction) -> Self {
         match action {
             CargoAction::Load(dest) => Self {
-                load: Some(CargoOp::Load { destination: dest }),
+                load: Some(dest),
                 ..Self::default()
             },
             CargoAction::Unload(dest) => Self {
-                unload: Some(CargoOp::Unload { destination: dest }),
+                unload: Some(dest),
                 ..Self::default()
             },
             CargoAction::Swap {
                 load_dest,
                 unload_dest,
             } => Self {
-                load: Some(CargoOp::Load {
-                    destination: load_dest,
-                }),
-                unload: Some(CargoOp::Unload {
-                    destination: unload_dest,
-                }),
+                load: Some(load_dest),
+                unload: Some(unload_dest),
             },
         }
     }
@@ -311,7 +284,6 @@ fn apply_tick(fleet: &mut Fleet, manifest: &[Cargo]) -> anyhow::Result<()> {
 
 #[derive(Debug, Clone, Copy)]
 enum EventLogChange {
-    NoOp,
     Add,
     Edit { at: usize, kind: EventLogEdit },
 }
@@ -324,34 +296,30 @@ enum EventLogEdit {
 }
 
 fn reduce_actions(old: CargoAction, new: CargoAction, dock: usize) -> Option<EventLogEdit> {
-    use EventLogEdit::*;
+    use {CargoAction::*, EventLogEdit::*};
     let (old, new) = (CargoOps::from(old), CargoOps::from(new));
-    let old_load = old.load.map(CargoOp::destination);
-    let old_unload = old.unload.map(CargoOp::destination);
-    let new_load = new.load.map(CargoOp::destination);
-    let new_unload = new.unload.map(CargoOp::destination);
-    let cancel_load = old_load == new_unload && new_unload.is_some_and(|dest| dest != dock);
-    let cancel_unload = old_unload == new_load && old_unload.is_some_and(|dest| dest != dock);
+    let cancel_load = old.load == new.unload && new.unload.is_some_and(|dest| dest != dock);
+    let cancel_unload = old.unload == new.load && old.unload.is_some_and(|dest| dest != dock);
 
     match (cancel_load, cancel_unload) {
         (false, false) => None,
         (true, true) => Some(Remove),
         (true, false) => Some(match (old.unload, new.load) {
             (None, None) => Remove,
-            (Some(old), None) => ReplaceWith(old.into()),
-            (None, Some(new)) => RemoveAndAdd(new.into()),
-            (Some(old), Some(new)) => ReplaceWith(CargoAction::Swap {
-                load_dest: new.destination(),
-                unload_dest: old.destination(),
+            (Some(unload), None) => ReplaceWith(Unload(unload)),
+            (None, Some(load)) => RemoveAndAdd(Load(load)),
+            (Some(old), Some(new)) => ReplaceWith(Swap {
+                load_dest: new,
+                unload_dest: old,
             }),
         }),
         (false, true) => Some(match (old.load, new.unload) {
             (None, None) => Remove,
-            (Some(old), None) => ReplaceWith(old.into()),
-            (None, Some(new)) => RemoveAndAdd(new.into()),
-            (Some(old), Some(new)) => ReplaceWith(CargoAction::Swap {
-                load_dest: old.destination(),
-                unload_dest: new.destination(),
+            (Some(load), None) => ReplaceWith(Load(load)),
+            (None, Some(unload)) => RemoveAndAdd(Unload(unload)),
+            (Some(load_dest), Some(unload_dest)) => ReplaceWith(CargoAction::Swap {
+                load_dest,
+                unload_dest,
             }),
         }),
     }
@@ -381,15 +349,6 @@ fn reduce_vessel_event(
 }
 
 fn reduce_cargo_event(event: &CargoEvent, events: &[Event]) -> EventLogChange {
-    if let CargoAction::Swap {
-        load_dest,
-        unload_dest,
-    } = event.action
-        && load_dest == unload_dest
-    {
-        return EventLogChange::NoOp;
-    }
-
     events
         .iter()
         .enumerate()
@@ -424,6 +383,20 @@ fn validate_action(
         bail!("vessel {vessel} is not docked");
     };
 
+    match action {
+        CargoAction::Unload(_) => (),
+        CargoAction::Load(dest) if dest != dock => (),
+        CargoAction::Swap {
+            load_dest,
+            unload_dest,
+        } if load_dest != dock => {
+            if load_dest == unload_dest {
+                bail!("swap on same dock {load_dest} is a noop");
+            }
+        }
+        _ => bail!("cannot load cargo destined to dock {dock} from itself"),
+    }
+
     // see if we can consolidate our event log with this new cargo op
     let event = CargoEvent {
         vessel: vessel.clone(),
@@ -433,7 +406,6 @@ fn validate_action(
     let edit = reduce_cargo_event(&event, events);
     let mut new_events = events.clone();
     match edit {
-        EventLogChange::NoOp => (),
         EventLogChange::Add => new_events.push(Event::Cargo(event)),
         EventLogChange::Edit { at, kind } => match kind {
             EventLogEdit::Remove => {
@@ -1045,10 +1017,15 @@ mod tests {
         prop_oneof![
             (1usize..4).prop_map(CargoAction::Load),
             (0usize..4).prop_map(CargoAction::Unload),
-            (1usize..4, 0usize..4).prop_map(|(load_dest, unload_dest)| CargoAction::Swap {
-                load_dest,
-                unload_dest,
-            }),
+            (1usize..4, 0usize..4)
+                .prop_filter(
+                    "swap destinations must differ",
+                    |(load_dest, unload_dest)| { load_dest != unload_dest }
+                )
+                .prop_map(|(load_dest, unload_dest)| CargoAction::Swap {
+                    load_dest,
+                    unload_dest,
+                }),
         ]
     }
 
