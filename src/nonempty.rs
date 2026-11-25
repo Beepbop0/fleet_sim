@@ -1,3 +1,4 @@
+#[derive(Debug, Clone)]
 pub struct NonEmpty<T> {
     pub head: T,
     pub rest: Vec<T>,

@@ -149,6 +149,7 @@ struct FleetState {
     cargo_manifest: Square,
 }
 
+#[derive(Debug, Clone)]
 pub struct Fleet {
     travel_times: Square,
     dock_throughput: Vec<usize>,
@@ -356,6 +357,29 @@ fn reduce_actions(old: CargoAction, new: CargoAction, dock: usize) -> Option<Eve
     }
 }
 
+fn reduce_vessel_event(
+    id: String,
+    pending_state: VesselState,
+    committed: VesselState,
+    events: &mut Vec<Event>,
+) {
+    events.retain(|event| match &event {
+        Event::Vessel { id: candidate, .. } if candidate == &id => false,
+        Event::Cargo(CargoEvent { vessel, .. })
+            if vessel == &id && !matches!(pending_state, VesselState::Docked { .. }) =>
+        {
+            false
+        }
+        _ => true,
+    });
+    if pending_state != committed {
+        events.push(Event::Vessel {
+            id,
+            state: pending_state,
+        });
+    }
+}
+
 fn reduce_cargo_event(event: &CargoEvent, events: &[Event]) -> EventLogChange {
     if let CargoAction::Swap {
         load_dest,
@@ -389,17 +413,12 @@ fn validate_action(
     action: CargoAction,
     events: &mut Vec<Event>,
     throughput: &[usize],
-    vessels: &HashMap<String, Vessel>,
-    cargo_manifest: &Square,
+    fleet_state: &FleetState,
 ) -> anyhow::Result<()> {
-    let VesselState::Docked { .. } = get_vessel(vessels, &vessel)?.state else {
+    let VesselState::Docked { .. } = get_vessel(&fleet_state.vessels, &vessel)?.state else {
         bail!("vessel {vessel} is not committed as docked");
     };
-    let mut pending = FleetState {
-        vessels: vessels.clone(),
-        cargo_manifest: cargo_manifest.clone(),
-    };
-    apply_events(&mut pending, events)?;
+    let pending = projected_state(fleet_state, events)?;
     let pending_vessel = get_vessel(&pending.vessels, &vessel)?;
     let VesselState::Docked { location: dock } = pending_vessel.state else {
         bail!("vessel {vessel} is not docked");
@@ -438,12 +457,8 @@ fn validate_action(
         },
     }
 
-    let mut pending = FleetState {
-        vessels: vessels.clone(),
-        cargo_manifest: cargo_manifest.clone(),
-    };
     // replay new events and see if the cargo accounting still makes sense
-    apply_events(&mut pending, &new_events)?;
+    projected_state(fleet_state, &new_events)?;
     // see if ops accounting checks out with new events
     let op_count = new_events
         .iter()
@@ -461,6 +476,12 @@ fn validate_action(
     *events = new_events;
 
     Ok(())
+}
+
+fn projected_state(fleet_state: &FleetState, events: &[Event]) -> anyhow::Result<FleetState> {
+    let mut pending = fleet_state.clone();
+    apply_events(&mut pending, events)?;
+    Ok(pending)
 }
 
 fn apply_events(fleet_state: &mut FleetState, events: &[Event]) -> anyhow::Result<()> {
@@ -527,11 +548,7 @@ fn apply_events(fleet_state: &mut FleetState, events: &[Event]) -> anyhow::Resul
 
 fn event<'a>(
     FleetView {
-        committed:
-            FleetState {
-                vessels: committed,
-                cargo_manifest,
-            },
+        committed: committed @ FleetState { vessels, .. },
         planned,
         travel_times,
         dock_throughput,
@@ -556,51 +573,51 @@ fn event<'a>(
 
     match command {
         SetDest { vessel_id, dest } => {
-            let existing = get_vessel(committed, &vessel_id)?;
-            let VesselState::Idle { location: from } = existing.state else {
+            let committed_state = get_vessel(vessels, &vessel_id)?.state;
+            let VesselState::Idle { location: from } = committed_state else {
                 bail!("vessel {vessel_id} is not idle");
             };
-            if from == dest {
-                planned
-                    .retain(|event| !matches!(event, Event::Vessel { id, .. } if id == &vessel_id));
-                return Ok(None);
-            }
-            let distance = travel_times[from][dest];
-            Ok(Some(Event::Vessel {
-                id: vessel_id,
-                state: VesselState::Transit {
+            let state = if from == dest {
+                VesselState::Idle { location: from }
+            } else {
+                VesselState::Transit {
                     from,
                     to: dest,
-                    arrives_at_tick: tick + distance,
-                },
-            }))
+                    arrives_at_tick: tick + travel_times[from][dest],
+                }
+            };
+            reduce_vessel_event(vessel_id, state, committed_state, planned);
+            Ok(None)
         }
         Dock { vessel_id } => {
-            let existing = get_vessel(committed, &vessel_id)?;
-            match existing.state {
-                VesselState::Idle { location } | VesselState::Docked { location } => {
-                    Ok(Some(Event::Vessel {
-                        id: vessel_id,
-                        state: VesselState::Docked { location },
-                    }))
+            let committed_state = get_vessel(vessels, &vessel_id)?.state;
+            let pending = projected_state(committed, planned)?;
+            match get_vessel(&pending.vessels, &vessel_id)?.state {
+                VesselState::Idle { location } => {
+                    reduce_vessel_event(
+                        vessel_id,
+                        VesselState::Docked { location },
+                        committed_state,
+                        planned,
+                    );
+                    Ok(None)
                 }
+                VesselState::Docked { .. } => Ok(None),
                 _ => Err(anyhow!("vessel {vessel_id} is not idle")),
             }
         }
         Undock { vessel_id } => {
-            let existing = get_vessel(committed, &vessel_id)?;
-            match existing.state {
+            let committed_state = get_vessel(vessels, &vessel_id)?.state;
+            let pending = projected_state(committed, planned)?;
+            match get_vessel(&pending.vessels, &vessel_id)?.state {
                 VesselState::Docked { location } => {
-                    planned.retain(|event| {
-                        !matches!(
-                            event,
-                            Event::Cargo(CargoEvent { vessel, .. }) if vessel == &vessel_id
-                        )
-                    });
-                    Ok(Some(Event::Vessel {
-                        id: vessel_id,
-                        state: VesselState::Idle { location },
-                    }))
+                    reduce_vessel_event(
+                        vessel_id,
+                        VesselState::Idle { location },
+                        committed_state,
+                        planned,
+                    );
+                    Ok(None)
                 }
                 _ => Err(anyhow!("vessel {vessel_id} is not docked")),
             }
@@ -612,7 +629,6 @@ fn event<'a>(
                 planned,
                 dock_throughput,
                 committed,
-                cargo_manifest,
             )?;
             Ok(None)
         }
@@ -623,7 +639,6 @@ fn event<'a>(
                 planned,
                 dock_throughput,
                 committed,
-                cargo_manifest,
             )?;
             Ok(None)
         }
@@ -641,7 +656,6 @@ fn event<'a>(
                 planned,
                 dock_throughput,
                 committed,
-                cargo_manifest,
             )?;
             Ok(None)
         }
@@ -800,6 +814,85 @@ mod tests {
 
         let json = serde_json::to_value(fleet.status(View::CommittedAt(0)))?;
         assert_eq!(json["payload"]["tick"], 0);
+        assert!(json["payload"].get("ops").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn operations_are_available_separately_from_standard_status() -> anyhow::Result<()> {
+        let mut fleet = init_fleet(Init {
+            cargo_manifest: vec![],
+            dock_throughput: vec![1],
+            travel_times: vec![vec![0]],
+            vessels: vec![VesselLocation {
+                vessel: "v1".into(),
+                location: 0,
+            }],
+        })?;
+        fleet.apply(FleetCommand::Planned(MutCommand::Dock {
+            vessel_id: "v1".into(),
+        }))?;
+
+        let json = serde_json::to_value(fleet.operations())?;
+        assert_eq!(
+            json,
+            serde_json::json!([{"operation": "dock", "vessel_id": "v1"}]),
+        );
+        let status = serde_json::to_value(fleet.status(View::Planned))?;
+        assert!(status["payload"].get("ops").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn dock_and_undock_reduce_to_the_committed_state() -> anyhow::Result<()> {
+        let mut idle = TestStateBuilder::new(1)
+            .idle_vessel("v1", vec![0])
+            .build_fleet(1);
+        idle.apply(FleetCommand::Planned(MutCommand::Dock {
+            vessel_id: "v1".into(),
+        }))?;
+        idle.apply(FleetCommand::Planned(MutCommand::Undock {
+            vessel_id: "v1".into(),
+        }))?;
+        assert!(idle.planned.is_empty());
+
+        let mut docked = TestStateBuilder::new(1)
+            .docked_vessel("v1", vec![0])
+            .build_fleet(1);
+        docked.apply(FleetCommand::Planned(MutCommand::Undock {
+            vessel_id: "v1".into(),
+        }))?;
+        docked.apply(FleetCommand::Planned(MutCommand::Dock {
+            vessel_id: "v1".into(),
+        }))?;
+        assert!(docked.planned.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn setting_a_docked_vessels_destination_is_rejected_atomically() -> anyhow::Result<()> {
+        let mut fleet = TestStateBuilder::new(2)
+            .docked_vessel("v1", vec![0; 2])
+            .idle_vessel("v2", vec![0; 2])
+            .dock_cargo(1, 1)
+            .build_fleet(1);
+        fleet.apply(FleetCommand::Planned(MutCommand::Load {
+            vessel_id: "v1".into(),
+            dest: 1,
+        }))?;
+        fleet.apply(FleetCommand::Planned(MutCommand::SetDest {
+            vessel_id: "v2".into(),
+            dest: 1,
+        }))?;
+        let planned_before = format!("{:?}", fleet.planned);
+
+        let result = fleet.apply(FleetCommand::Planned(MutCommand::SetDest {
+            vessel_id: "v1".into(),
+            dest: 0,
+        }));
+
+        assert_eq!(result.unwrap_err().to_string(), "vessel v1 is not idle");
+        assert_eq!(format!("{:?}", fleet.planned), planned_before);
         Ok(())
     }
 
@@ -1086,8 +1179,7 @@ mod tests {
                 new_action,
                 &mut events,
                 &[unreduced_op_count; 4],
-                &state.vessels,
-                &state.cargo_manifest,
+                &state,
             ).unwrap();
 
             let mut actual = state.clone();
@@ -1115,8 +1207,7 @@ mod tests {
                 new,
                 &mut events,
                 &[1; 4],
-                &state.vessels,
-                &state.cargo_manifest,
+                &state,
             ).unwrap();
 
             prop_assert!(events.is_empty());
@@ -1140,8 +1231,7 @@ mod tests {
                 action,
                 &mut events,
                 &[1; 4],
-                &state.vessels,
-                &state.cargo_manifest,
+                &state,
             );
 
             prop_assert!(result.is_err());
@@ -1315,8 +1405,7 @@ mod tests {
                 CargoAction::Load(destination),
                 &mut events,
                 &[prefix_operations + suffix_operations + 3; 4],
-                &state.vessels,
-                &state.cargo_manifest,
+                &state,
             );
 
             prop_assert!(result.is_err());
