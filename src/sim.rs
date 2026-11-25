@@ -298,8 +298,8 @@ enum EventLogEdit {
 fn reduce_actions(old: CargoAction, new: CargoAction, dock: usize) -> Option<EventLogEdit> {
     use {CargoAction::*, EventLogEdit::*};
     let (old, new) = (CargoOps::from(old), CargoOps::from(new));
-    let cancel_load = old.load == new.unload && new.unload.is_some_and(|dest| dest != dock);
-    let cancel_unload = old.unload == new.load && old.unload.is_some_and(|dest| dest != dock);
+    let cancel_load = old.load == new.unload && new.unload.is_some_and(|d| d != dock);
+    let cancel_unload = old.unload == new.load && old.unload.is_some();
 
     match (cancel_load, cancel_unload) {
         (false, false) => None,
@@ -394,7 +394,28 @@ fn validate_action(
                 bail!("swap on same dock {load_dest} is a noop");
             }
         }
-        _ => bail!("cannot load cargo destined to dock {dock} from itself"),
+        _ => {
+            let undo_delivery = events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::Cargo(CargoEvent {
+                        vessel: id,
+                        dock: this_dock,
+                        action,
+                    }) if *id == vessel && *this_dock == dock => Some(action),
+                    _ => None,
+                })
+                .any(|action| {
+                    matches!(action, CargoAction::Swap {
+                        unload_dest: this_dock,
+                        ..
+                    }
+                    | CargoAction::Unload(this_dock) if *this_dock == dock)
+                });
+            if !undo_delivery {
+                bail!("cannot load cargo destined to dock {dock} from itself");
+            }
+        }
     }
 
     // see if we can consolidate our event log with this new cargo op
