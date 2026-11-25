@@ -679,6 +679,85 @@ pub struct WorldState<'a> {
     pub cargo: Vec<Cargo>,
 }
 
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum Operation<'a> {
+    SetDestination {
+        vessel_id: &'a str,
+        destination: usize,
+    },
+    Dock {
+        vessel_id: &'a str,
+    },
+    Undock {
+        vessel_id: &'a str,
+    },
+    Load {
+        vessel_id: &'a str,
+        destination: usize,
+    },
+    Unload {
+        vessel_id: &'a str,
+        destination: usize,
+    },
+    Swap {
+        vessel_id: &'a str,
+        load_destination: usize,
+        unload_destination: usize,
+    },
+}
+
+impl<'a> From<&'a Event> for Operation<'a> {
+    fn from(event: &'a Event) -> Self {
+        match event {
+            Event::Vessel {
+                id,
+                state: VesselState::Transit { to, .. },
+            } => Self::SetDestination {
+                vessel_id: id,
+                destination: *to,
+            },
+            Event::Vessel {
+                id,
+                state: VesselState::Docked { .. },
+            } => Self::Dock { vessel_id: id },
+            Event::Vessel {
+                id,
+                state: VesselState::Idle { .. },
+            } => Self::Undock { vessel_id: id },
+            Event::Cargo(CargoEvent {
+                vessel,
+                action: CargoAction::Load(destination),
+                ..
+            }) => Self::Load {
+                vessel_id: vessel,
+                destination: *destination,
+            },
+            Event::Cargo(CargoEvent {
+                vessel,
+                action: CargoAction::Unload(destination),
+                ..
+            }) => Self::Unload {
+                vessel_id: vessel,
+                destination: *destination,
+            },
+            Event::Cargo(CargoEvent {
+                vessel,
+                action:
+                    CargoAction::Swap {
+                        load_dest,
+                        unload_dest,
+                    },
+                ..
+            }) => Self::Swap {
+                vessel_id: vessel,
+                load_destination: *load_dest,
+                unload_destination: *unload_dest,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "status", content = "payload", rename_all = "lowercase")]
 pub enum Status<'a> {
@@ -771,6 +850,10 @@ fn status(
 impl Fleet {
     pub fn status(&self, view: View) -> Status<'_> {
         status(self, view)
+    }
+
+    pub fn operations(&self) -> Vec<Operation<'_>> {
+        self.planned.iter().map(Operation::from).collect()
     }
 }
 

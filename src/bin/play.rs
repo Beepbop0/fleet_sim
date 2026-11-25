@@ -2,9 +2,69 @@ use anyhow::{Context, anyhow, bail};
 use fleet_sim::{
     Cargo, FleetCommand, Init, InitCommand, MutCommand, Tick, TopCommand, VesselLocation,
     ViewCommand,
-    sim::{Fleet, Status, View},
+    sim::{Fleet, Operation, Status, View, WorldState},
 };
-use std::io::{self, BufRead};
+use serde::Serialize;
+use std::{
+    env, fs,
+    io::{self, BufRead},
+    path::Path,
+};
+
+const HELP: &str = r#"Fleet simulator command grammar:
+
+  init ROWS VESSELS THROUGHPUT [CARGO]
+  tick [CARGO]
+  get_state | state
+  get_state_at TICK | state_at TICK
+  set_destination VESSEL DESTINATION | set_dest VESSEL DESTINATION
+  dock VESSEL
+  undock VESSEL
+  load VESSEL DESTINATION
+  unload VESSEL DESTINATION
+  swap VESSEL LOAD_DESTINATION UNLOAD_DESTINATION
+  help
+
+Value formats:
+  ROWS        comma-separated travel times; semicolon-separated rows
+  VESSELS     comma-separated ID:LOCATION entries
+  THROUGHPUT  comma-separated dock throughput values
+  CARGO       comma-separated LOCATION:DESTINATION:QUANTITY entries
+
+Use - for an empty list. Blank lines and lines beginning with # are ignored.
+Command results are written as JSON to stdout; this help is written to stderr.
+
+Pass a file containing one `init` command to initialize before reading stdin:
+  cargo run --bin play -- FLEET_FILE"#;
+
+#[derive(Serialize)]
+#[serde(tag = "status", content = "payload", rename_all = "lowercase")]
+enum PlayStatus<'a> {
+    Ok(PlayState<'a>),
+    #[serde(rename = "error")]
+    Err {
+        message: String,
+    },
+}
+
+#[derive(Serialize)]
+struct PlayState<'a> {
+    #[serde(flatten)]
+    state: WorldState<'a>,
+    ops: Vec<Operation<'a>>,
+}
+
+fn play_status(fleet: &Fleet, view: View) -> PlayStatus<'_> {
+    let ops = if view == View::Planned {
+        fleet.operations()
+    } else {
+        Vec::new()
+    };
+    match fleet.status(view) {
+        Status::Ok(state) => PlayStatus::Ok(PlayState { state, ops }),
+        Status::Err { message } => PlayStatus::Err { message },
+    }
+}
 
 fn numbers(value: &str, name: &str) -> anyhow::Result<Vec<usize>> {
     if value == "-" {
@@ -139,37 +199,37 @@ fn exact(fields: &[&str], expected: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn execute(command: TopCommand, sim: &mut Option<Fleet>) -> Status<'_> {
+fn execute(command: TopCommand, sim: &mut Option<Fleet>) -> PlayStatus<'_> {
     match command {
         TopCommand::Init(InitCommand::Init(init)) => {
             if sim.is_some() {
-                return Status::Err {
+                return PlayStatus::Err {
                     message: "already called init".into(),
                 };
             }
             match Fleet::init(init) {
                 Ok(fleet) => {
                     *sim = Some(fleet);
-                    sim.as_ref().unwrap().status(View::LastCommitted)
+                    play_status(sim.as_ref().unwrap(), View::LastCommitted)
                 }
-                Err(error) => Status::Err {
+                Err(error) => PlayStatus::Err {
                     message: error.to_string(),
                 },
             }
         }
         TopCommand::Fleet(command) => {
             let Some(fleet) = sim.as_mut() else {
-                return Status::Err {
+                return PlayStatus::Err {
                     message: "must call init first".into(),
                 };
             };
             let view = match View::for_command(&command) {
                 Ok(view) => view,
-                Err(message) => return Status::Err { message },
+                Err(message) => return PlayStatus::Err { message },
             };
             match fleet.apply(command) {
-                Ok(()) => fleet.status(view),
-                Err(error) => Status::Err {
+                Ok(()) => play_status(fleet, view),
+                Err(error) => PlayStatus::Err {
                     message: error.to_string(),
                 },
             }
@@ -177,17 +237,66 @@ fn execute(command: TopCommand, sim: &mut Option<Fleet>) -> Status<'_> {
     }
 }
 
+fn fleet_from_str(contents: &str) -> anyhow::Result<Fleet> {
+    let mut commands = contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'));
+    let line = commands
+        .next()
+        .ok_or_else(|| anyhow!("fleet file does not contain an init command"))?;
+    if commands.next().is_some() {
+        bail!("fleet file must contain exactly one init command");
+    }
+
+    match parse(line).context("failed to parse fleet file")? {
+        TopCommand::Init(InitCommand::Init(init)) => {
+            Fleet::init(init).context("fleet file does not describe a valid fleet")
+        }
+        TopCommand::Fleet(_) => bail!("fleet file must contain an init command"),
+    }
+}
+
+fn fleet_from_file(path: &Path) -> anyhow::Result<Fleet> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("failed to read fleet file `{}`", path.display()))?;
+    fleet_from_str(&contents)
+        .with_context(|| format!("failed to initialize from `{}`", path.display()))
+}
+
 fn main() -> anyhow::Result<()> {
     let stdin = io::stdin();
-    let mut sim = None;
+    let mut args = env::args_os().skip(1);
+    let fleet_file = args.next();
+    if args.next().is_some() {
+        bail!("usage: play [FLEET_FILE]");
+    }
+
+    let mut sim = fleet_file
+        .as_deref()
+        .map(Path::new)
+        .map(fleet_from_file)
+        .transpose()?;
+    eprintln!("{HELP}");
+    if let Some(fleet) = sim.as_ref() {
+        println!(
+            "{}",
+            serde_json::to_string(&play_status(fleet, View::LastCommitted))?
+        );
+    }
     for line in stdin.lock().lines() {
         let line = line?;
-        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let status = match parse(&line) {
+        if line.eq_ignore_ascii_case("help") {
+            eprintln!("{HELP}");
+            continue;
+        }
+        let status = match parse(line) {
             Ok(command) => execute(command, &mut sim),
-            Err(error) => Status::Err {
+            Err(error) => PlayStatus::Err {
                 message: error.to_string(),
             },
         };
@@ -222,5 +331,36 @@ mod tests {
     #[test]
     fn rejects_extra_arguments() {
         assert!(parse("dock v1 extra").is_err());
+    }
+
+    #[test]
+    fn play_output_includes_pending_operations() -> anyhow::Result<()> {
+        let mut sim = None;
+        execute(parse("init 0 v1:0 1")?, &mut sim);
+        let status = execute(parse("dock v1")?, &mut sim);
+
+        let json = serde_json::to_value(status)?;
+        assert_eq!(
+            json["payload"]["ops"],
+            serde_json::json!([{"operation": "dock", "vessel_id": "v1"}]),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn initializes_fleet_from_text_file_contents() -> anyhow::Result<()> {
+        let fleet = fleet_from_str("# initial fleet\n\ninit 0,4;4,0 v1:0 2,3 0:1:5\n")?;
+        let json = serde_json::to_value(play_status(&fleet, View::LastCommitted))?;
+
+        assert_eq!(json["payload"]["tick"], 0);
+        assert_eq!(json["payload"]["vessels"]["v1"]["location"], 0);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_invalid_fleet_file_contents() {
+        assert!(fleet_from_str("tick").is_err());
+        assert!(fleet_from_str("init 0 v1:1 1").is_err());
+        assert!(fleet_from_str("init 0 v1:0 1\ntick").is_err());
     }
 }

@@ -26,6 +26,26 @@ get_state
 get_state_at 1
 ```
 
+To start with an initialized fleet, put one `init` command (using the same
+grammar) in a file and pass its path to `play`:
+
+```text
+cargo run --bin play -- fleet.txt
+```
+
+The file may contain blank lines and comments beginning with `#`, but exactly
+one non-comment command is required and it must be `init`. `play` exits with a
+non-zero status before reading interactive commands if the file cannot be read,
+parsed, or converted into a valid fleet. The initial fleet state is printed to
+stdout on success.
+
+The grammar and value formats are printed to stderr when `play` starts. Enter
+`help` at any time to print them again; command results remain JSON on stdout.
+The `play` binary enriches each successful state payload with an `ops` array
+containing the normalized operations pending for the current tick. Committed
+states returned by `tick` or `get_state_at` have an empty `ops` array. This
+additional field is not emitted by the regular `fleet_sim` binary.
+
 The full command grammar is:
 
 ```text
@@ -39,6 +59,7 @@ undock VESSEL
 load VESSEL DESTINATION
 unload VESSEL DESTINATION
 swap VESSEL LOAD_DESTINATION UNLOAD_DESTINATION
+help
 ```
 
 Rows are comma-separated and joined with semicolons. Vessels use
